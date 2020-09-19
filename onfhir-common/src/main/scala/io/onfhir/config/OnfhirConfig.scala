@@ -57,6 +57,9 @@ object OnfhirConfig {
   /** Default value for [CapabilityStatement|Conformance].rest.resource.conditionalCreate when not present */
   lazy val fhirDefaultConditionalCreate:Boolean = Try(config.getBoolean("fhir.default.conditional-create")).getOrElse(false)
 
+  /** Default value for [CapabilityStatement|Conformance].rest.resource.conditionalRead when not present */
+  lazy val fhirDefaultConditionalRead:String = Try(config.getString("fhir.default.conditional-read")).getOrElse("full-support")
+
   /** Default value for [CapabilityStatement|Conformance].rest.resource.conditionalUpdate when not present */
   lazy val fhirDefaultConditionalUpdate:Boolean = Try(config.getBoolean("fhir.default.conditional-update")).getOrElse(false)
 
@@ -129,9 +132,9 @@ object OnfhirConfig {
   lazy val fhirValidation:String = Try(config.getString("fhir.validation")).toOption.getOrElse(FHIR_VALIDATION_ALTERNATIVES.PROFILE)
 
   /** Indicates how to handle erroneous search requests*/
-  lazy val fhirSearchHandling:String = Try(config.getString("fhir.search-handling")).toOption.getOrElse(FHIR_HTTP_OPTIONS.FHIR_SEARCH_LENIENT)
+  lazy val fhirSearchHandling:String = Try(config.getString("fhir.search-handling")).toOption.getOrElse(FHIR_HTTP_OPTIONS.FHIR_SEARCH_STRICT)
 
-  /** Which Foundation resource types we should persist into database from base standart */
+  /** Which Foundation resource types we should persist into database from base standard */
   lazy val fhirPersistBaseDefinitions:Set[String] = Try(config.getStringList("fhir.persisted-base-definitions")).toOption.map(_.asScala.toSet).getOrElse(Set.empty[String])
 
   /** Auditing related configurations */
@@ -147,4 +150,17 @@ object OnfhirConfig {
     * Authorization configurations
     */
   lazy val authzConfig:AuthzConfig = new AuthzConfig(OnfhirConfig.config.getConfig("fhir.authorization"))
+
+  /**
+   * FHIR Subscription related configuration
+   */
+  //Enables sending FHIR subscription events to kafka so onfhir-subscription module can work
+  lazy val fhirSubscriptionActive = Try(config.getBoolean("fhir.subscription.active")).toOption.getOrElse(false)
+  lazy val fhirSubscriptionAllowedResources = Try(config.getStringList("fhir.subscription.allowed-resources")).toOption.map(_.asScala.toSeq)
+  /**
+   * Internal API configurations
+   */
+  lazy val internalApiActive:Boolean = Try(config.getBoolean("server.internal.active")).toOption.getOrElse(false)
+  lazy val internalApiPort:Int = Try(config.getInt("server.internal.port")).toOption.getOrElse(8081)
+  lazy val internalApiAuthenticate:Boolean = Try(config.getBoolean("server.internal.authenticate")).toOption.getOrElse(false)
 }

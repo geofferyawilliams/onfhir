@@ -37,8 +37,23 @@ object FhirPathValueTransformer {
     Try(FhirPathLiteralEvaluator.parseFhirDateTimeBest(str)).toOption
       .map(FhirPathDateTime)
       .getOrElse(
-        Try(FhirPathLiteralEvaluator.parseFhirTime("T"+str)).toOption
-          .map(t => FhirPathTime(t._1, t._2))
-          .getOrElse(FhirPathString(str)))
+        //If it seems to be a FHIR time, try to parse it
+        if(str.count(_ == ':') == 3)
+          Try(FhirPathLiteralEvaluator.parseFhirTime("T"+str)).toOption
+            .map(t => FhirPathTime(t._1, t._2))
+            .getOrElse(FhirPathString(str))
+        else
+          FhirPathString(str)
+       )
+  }
+
+
+  def serializeToJson(result:Seq[FhirPathResult]):JValue = {
+    val jsonValues = result.map(_.toJson)
+    jsonValues.length match {
+      case 0 => JNull
+      case 1 => jsonValues.head
+      case _ => JArray(jsonValues.toList)
+    }
   }
 }

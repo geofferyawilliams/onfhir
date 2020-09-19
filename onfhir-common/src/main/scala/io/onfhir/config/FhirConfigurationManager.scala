@@ -1,9 +1,9 @@
 package io.onfhir.config
 
-import io.onfhir.api.validation.IFhirResourceValidator
+import io.onfhir.api.validation.{IFhirResourceValidator, IFhirTerminologyValidator}
 import io.onfhir.audit.IFhirAuditCreator
 import org.slf4j.{Logger, LoggerFactory}
-
+import io.onfhir.api.DEFAULT_IMPLEMENTED_FHIR_OPERATIONS
 /**
   * Created by tuncay on 11/14/2016.
   * Central OnFhir configurations defining FHIR server capabilities
@@ -14,24 +14,26 @@ object FhirConfigurationManager {
   var fhirConfig:FhirConfig = _
   //FHIR Resource validator
   var fhirValidator:IFhirResourceValidator = _
+  //FHIR terminology validator
+  var fhirTerminologyValidator:IFhirTerminologyValidator = _
   //Audit generator in FHIR AuditEvent format based on the specific version
   var fhirAuditCreator:IFhirAuditCreator = _
   /**
     * Read FHIR foundational definitions and configure the platform
     * @param fhirConfigurator Specific FHIR configurator for the FHIR version to be supported
     */
-  def initialize(fhirConfigurator:IFhirConfigurator) : Unit = {
+  def initialize(fhirConfigurator:IFhirVersionConfigurator, fhirOperationImplms:Map[String, String] = Map.empty[String, String]) : Unit = {
     //Initialize platform, and save the configuration
-    val platformConfigs = fhirConfigurator.initializePlatform(OnfhirConfig.fhirInitialize)
-    fhirConfig = platformConfigs._1
+    fhirConfig = fhirConfigurator.initializePlatform(OnfhirConfig.fhirInitialize, DEFAULT_IMPLEMENTED_FHIR_OPERATIONS ++ fhirOperationImplms)
 
     //If it is the first setup or update of the platform (definition of new profile, etc), apply the setups
     if(OnfhirConfig.fhirInitialize) {
       //Read the Value sets
-      fhirConfigurator.setupPlatform(fhirConfig, platformConfigs._2, platformConfigs._3, platformConfigs._4, platformConfigs._5, platformConfigs._6, platformConfigs._7, platformConfigs._8, platformConfigs._9)
+      fhirConfigurator.setupPlatform(fhirConfig)
     }
-    //Initialize FHIR Resource Validator
-    fhirValidator = fhirConfigurator.getResourceValidator()
+    //Initialize FHIR Resource and terminology Validator
+    fhirValidator = fhirConfigurator.getResourceValidator(fhirConfig)
+    fhirTerminologyValidator = fhirConfigurator.getTerminologyValidator(fhirConfig)
     //Initialize FHIR Audit creator if necessary
     if(OnfhirConfig.fhirAuditingRepository.equalsIgnoreCase("local") || OnfhirConfig.fhirAuditingRepository.equalsIgnoreCase("remote"))
       fhirAuditCreator = fhirConfigurator.getAuditCreator()

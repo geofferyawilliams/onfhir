@@ -2,7 +2,6 @@ package io.onfhir.api.model
 
 import akka.http.javadsl.model.headers.WWWAuthenticate
 import akka.http.scaladsl.model._
-import ca.uhn.fhir.validation.ResultSeverityEnum
 import io.onfhir.api.Resource
 import io.onfhir.api._
 import io.onfhir.util.JsonFormatter._
@@ -44,6 +43,13 @@ object FHIRResponse {
   final val DETAILS = "details"
   final val DIAGNOSTICS = "diagnostics"
   final val LOCATION = "location"
+
+  object SEVERITY_CODES {
+    val WARNING = "warning"
+    val ERROR = "error"
+    val FATAL = "fatal"
+    val INFORMATION  = "information"
+  }
 
   object OUTCOME_CODES {
     val INVALID = "invalid"
@@ -92,6 +98,6 @@ object FHIRResponse {
     * @return
     */
   def createOperationOutcomeWithSuccess():Resource = {
-    createOperationOutcome(Seq(OutcomeIssue(ResultSeverityEnum.INFORMATION.getCode, OUTCOME_CODES.INFORMATIONAL, None, Some("Operation successful :)"), Nil)))
+    createOperationOutcome(Seq(OutcomeIssue(SEVERITY_CODES.INFORMATION, OUTCOME_CODES.INFORMATIONAL, None, Some("Operation successful :)"), Nil)))
   }
 }

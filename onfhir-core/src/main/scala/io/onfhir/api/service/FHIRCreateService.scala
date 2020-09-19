@@ -1,10 +1,9 @@
 package io.onfhir.api.service
 
 import akka.http.scaladsl.model.{StatusCodes, Uri}
-import ca.uhn.fhir.validation.ResultSeverityEnum
 import io.onfhir.api._
 import io.onfhir.api.model.{FHIRRequest, FHIRResponse, OutcomeIssue}
-import io.onfhir.api.parsers.FHIRSearchParameterParser
+import io.onfhir.api.parsers.FHIRSearchParameterValueParser
 import io.onfhir.api.util.FHIRUtil
 import io.onfhir.api.validation.FHIRApiValidator
 import io.onfhir.authz.AuthzContext
@@ -30,7 +29,11 @@ class FHIRCreateService(transactionSession: Option[TransactionSession] = None) e
     //1.2) Check if resource type in the content match with the given type in URL
     FHIRApiValidator.validateResourceType(fhirRequest.resource.get, fhirRequest.resourceType.get)
     //1.3) Validate the conformance of resource
-    fhirValidator.validateResource(fhirRequest.resource.get).map(_ => Unit)
+    fhirValidator.validateResource(fhirRequest.resource.get, fhirRequest.resourceType.get)
+      .map(_ =>
+        //1.4) Extra business rules if exist
+        FHIRApiValidator.validateExtraRules(fhirRequest)
+      )
   }
 
   /**
@@ -59,7 +62,7 @@ class FHIRCreateService(transactionSession: Option[TransactionSession] = None) e
     if(ifNoneExist.isDefined){
       val parameters = Uri.Query(ifNoneExist.get).toMultiMap
       //Parse the parameters
-      val parsedParameters = FHIRSearchParameterParser.parseSearchParameters( _type, parameters, prefer)
+      val parsedParameters = FHIRSearchParameterValueParser.parseSearchParameters( _type, parameters, prefer)
       // Search the resources; only we need mandatory elements e.g. id, meta
       ResourceManager
         .queryResources(_type, parsedParameters, count = 2, elementsIncludedOrExcluded = Some(true -> Set.empty), excludeExtraFields = true).flatMap(matchedResources =>
@@ -71,7 +74,7 @@ class FHIRCreateService(transactionSession: Option[TransactionSession] = None) e
           //Multiple matches: The server returns a 412 Precondition Failed error indicating the client's criteria were not selective enough
           case _  => throw new PreconditionFailedException(Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode, //fatal
+              FHIRResponse.SEVERITY_CODES.ERROR, //fatal
               FHIRResponse.OUTCOME_CODES.INVALID,
               None,
               Some(s"Your query is not selective enough, more than 1 document matches."),
@@ -93,7 +96,7 @@ class FHIRCreateService(transactionSession: Option[TransactionSession] = None) e
     */
   private def constructIgnore(prefer:Option[String], _type:String, resource:Resource):FHIRResponse = {
     if(prefer.isDefined && prefer.get.equalsIgnoreCase(FHIR_HTTP_OPTIONS.FHIR_RETURN_OPERATION_OUTCOME))
-      FHIRResponse.errorResponse(StatusCodes.OK, Seq(OutcomeIssue(ResultSeverityEnum.INFORMATION.getCode, FHIRResponse.OUTCOME_CODES.INFORMATIONAL, None, Some("Your query matches a resource, so ignoring create..."), Nil)))
+      FHIRResponse.errorResponse(StatusCodes.OK, Seq(OutcomeIssue(FHIRResponse.SEVERITY_CODES.INFORMATION, FHIRResponse.OUTCOME_CODES.INFORMATIONAL, None, Some("Your query matches a resource, so ignoring create..."), Nil)))
     else {
       //Extract the base meta fields
       val (id, version, lastModified) = FHIRUtil.extractBaseMetaFields(resource)
@@ -122,7 +125,7 @@ class FHIRCreateService(transactionSession: Option[TransactionSession] = None) e
       ResourceManager.createResource(_type, resource, generatedId)(transactionSession) flatMap { case (newId, newVersion, lastModified, createdResource) =>
         Future.apply(FHIRResponse (
           StatusCodes.Created, //Http Status code
-          Some(FHIRUtil.getResourceContentByPreference(createdResource, prefer)), //HTTP body
+          FHIRUtil.getResourceContentByPreference(createdResource, prefer), //HTTP body
           Some(Uri(FHIRUtil.resourceLocationWithVersion(_type, newId, newVersion))), //HTTP Location header
           Some(lastModified), //HTTP Last-Modified header
           Some(newVersion) // HTTP ETag header

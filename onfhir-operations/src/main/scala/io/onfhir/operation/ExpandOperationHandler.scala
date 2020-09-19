@@ -3,10 +3,10 @@ package io.onfhir.operation
 import java.util.UUID
 
 import akka.http.scaladsl.model.{DateTime, StatusCodes, Uri}
-import ca.uhn.fhir.validation.ResultSeverityEnum
+
 import io.onfhir.api.Resource
 import io.onfhir.api.model._
-import io.onfhir.api.parsers.FHIRSearchParameterParser
+import io.onfhir.api.parsers.FHIRSearchParameterValueParser
 import io.onfhir.api.service.FHIROperationHandlerService
 import io.onfhir.api.util.FHIRUtil
 import io.onfhir.db.ResourceManager
@@ -47,17 +47,17 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
     if (resourceId.isDefined)
       Map(SEARCHPARAM_ID -> List(resourceId.get))
       //searchParams.put(SEARCHPARAM_ID, List(Parameter(FHIR_PARAMETER_TYPES.TOKEN, SEARCHPARAM_ID, resourceId.get)))
-    else if (operationRequest.extractParam[String](SEARCHPARAM_ID).isDefined)
+    else if (operationRequest.extractParamValue[String](SEARCHPARAM_ID).isDefined)
       //searchParams.put(SEARCHPARAM_ID, List(Parameter(FHIR_PARAMETER_TYPES.TOKEN, SEARCHPARAM_ID, operationRequest.extractParam[String](SEARCHPARAM_ID).get)))
-      Map(SEARCHPARAM_ID -> List(operationRequest.extractParam[String](SEARCHPARAM_ID).get))
-    else if (operationRequest.extractParam[String](SEARCHPARAM_URL).isDefined)
+      Map(SEARCHPARAM_ID -> List(operationRequest.extractParamValue[String](SEARCHPARAM_ID).get))
+    else if (operationRequest.extractParamValue[String](SEARCHPARAM_URL).isDefined)
       //searchParams.put(SEARCHPARAM_URL, List(Parameter(FHIR_PARAMETER_TYPES.URI, SEARCHPARAM_URL, operationRequest.extractParam[String](SEARCHPARAM_URL).get)))
-      Map(SEARCHPARAM_URL -> List(operationRequest.extractParam[String](SEARCHPARAM_URL).get))
+      Map(SEARCHPARAM_URL -> List(operationRequest.extractParamValue[String](SEARCHPARAM_URL).get))
     else {
       logger.debug("ValueSet cannot be identified, return 400 BadRequest...")
       throw new BadRequestException(Seq(
         OutcomeIssue(
-          ResultSeverityEnum.ERROR.getCode,
+          FHIRResponse.SEVERITY_CODES.ERROR,
           FHIRResponse.OUTCOME_CODES.PROCESSING,
           None,
           Some("$expand operation at the type level (no ID specified) requires an identifier as part of the request"),
@@ -71,7 +71,7 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
 
   def handleExpand(queryParams: Map[String, List[String]], operationRequest: FHIROperationRequest): Future[FHIROperationResponse] = {
 
-    val searchParams:List[Parameter] = FHIRSearchParameterParser.parseSearchParameters(RESOURCE_VALUESET, queryParams)
+    val searchParams:List[Parameter] = FHIRSearchParameterValueParser.parseSearchParameters(RESOURCE_VALUESET, queryParams)
 
     ResourceManager
       .queryResources(RESOURCE_VALUESET, searchParams, count = 1, excludeExtraFields = true).map {
@@ -79,7 +79,7 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
         logger.debug("resource not found, return 404 NotFound...")
         throw new NotFoundException(Seq(
           OutcomeIssue(
-            ResultSeverityEnum.INFORMATION.getCode,
+            FHIRResponse.SEVERITY_CODES.INFORMATION,
             FHIRResponse.OUTCOME_CODES.INFORMATIONAL,
             None,
             if (queryParams.contains(SEARCHPARAM_ID))
@@ -175,7 +175,7 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
   def buildExpansion(valueSet:Resource, operationRequest: FHIROperationRequest):Resource = {
     val compose = (valueSet \ VALUESET_COMPOSE).extractOrElse(JObject())
 
-    val filterKeys: Seq[String] = operationRequest.extractParam[String](EXPAND_PARAM_FILTER).getOrElse("").split(",")
+    val filterKeys: Seq[String] = operationRequest.extractParamValue[String](EXPAND_PARAM_FILTER).getOrElse("").split(",")
 
 
     // 1) First, filter all the matching concepts
@@ -187,12 +187,9 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
                var matching = JObject()
                (include \ "system").extractOpt[String].foreach(s => {matching = matching ~ ("system" -> s)})
                (include \ "version").extractOpt[String].foreach(v => {matching = matching ~ ("version" -> v)})
-               (include \ "extension") match {
-                  case JNothing => None
-                  case other =>  matching = matching ~ ("extension" -> other)
-               }
-               (concept \ "display").extractOpt[String].foreach(d => {matching = matching ~ ("display" -> d)})
                (concept \ "code").extractOpt[String].foreach(c => {matching = matching ~ ("code" -> c)})
+               (concept \ "display").extractOpt[String].foreach(d => {matching = matching ~ ("display" -> d)})
+               (concept \ "extension").extractOpt[JArray].foreach(arr => {matching = matching ~ ("extension" -> arr)})
                Some(matching)
              } else None
           })
@@ -236,7 +233,7 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
           ("total" -> matchingList.size) ~
           ("contains" -> matchingList)
 
-      resultValueSet ~ (VALUESET_EXPANSION -> expansion)
+      resultValueSet = resultValueSet ~ (VALUESET_EXPANSION -> expansion)
 
       /*val expansion = mutable.LinkedHashMap[String, Any]()
       expansion.put("identifier", UUID.randomUUID().toString)
@@ -255,8 +252,8 @@ class ExpandOperationHandler extends FHIROperationHandlerService {
   def containsAll(input:JValue, keys:Seq[String]): Boolean = {
 
     keys foreach (key =>
-      if(!((input \ "display").extractOpt[String].map(_.toLowerCase).contains(key.toLowerCase) ||
-        (input \ "code").extractOpt[String].map(_.toLowerCase).contains(key.toLowerCase)))
+      if(!((input \ "display").extractOpt[String].getOrElse("").toLowerCase.contains(key.toLowerCase) ||
+        (input \ "code").extractOpt[String].getOrElse("").toLowerCase.contains(key.toLowerCase)))
         return false
     )
     true

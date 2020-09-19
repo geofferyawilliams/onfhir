@@ -1,12 +1,14 @@
 package io.onfhir.db
 
 import io.onfhir.api._
-import com.mongodb.client.model.Filters
+import org.mongodb.scala.model.Filters
+import org.mongodb.scala.model.Filters._
+
 import io.onfhir.api.util.FHIRUtil
 import io.onfhir.config.OnfhirConfig
 import io.onfhir.exception.{InternalServerException, InvalidParameterException}
 import org.mongodb.scala.bson.conversions.Bson
-import org.mongodb.scala.model.Filters.{regex, _}
+
 
 import scala.collection.immutable.HashMap
 
@@ -82,7 +84,12 @@ object SearchUtil {
       case FHIR_DATA_TYPES.PERIOD =>
         PrefixModifierHandler.periodPrefixHandler(queryPath.getOrElse(""), dateValue, prefix, isTiming = false)
       case FHIR_DATA_TYPES.TIMING =>
-        PrefixModifierHandler.periodPrefixHandler(queryPath.getOrElse(""), dateValue, prefix, isTiming = true)
+        //TODO Handle event case better by special query on array (should match for all elements, not or)
+        Filters.or(
+          PrefixModifierHandler.timingEventHandler(queryPath.getOrElse(""), dateValue, prefix),
+          //PrefixModifierHandler.dateRangePrefixHandler(FHIRUtil.mergeElementPath(queryPath, "event"), dateValue, prefix),
+          PrefixModifierHandler.periodPrefixHandler(queryPath.getOrElse(""), dateValue, prefix, isTiming = true)
+        )
       case other =>
         throw new InternalServerException(s"Unknown target element type $other !!!")
     }
@@ -93,18 +100,17 @@ object SearchUtil {
     }
   }
 
-
   /**
-    * String parameter serves as the input for a case- and accent-insensitive search against sequences of
-    * characters, :exact modifier is used for case and accent sensitive search, :contains modifier is
-    * used for case and accent insensitive partial matching search.
-    *
-    * @param value Query value of the string parameter
-    * @param prefix Prefix to be handled
-    * @param path Path to the target element to be queried
-    * @param targetType FHIR Type of the target element
-    * @return respective BsonDocument for target query
-    */
+   * String parameter serves as the input for a case- and accent-insensitive search against sequences of
+   * characters, :exact modifier is used for case and accent sensitive search, :contains modifier is
+   * used for case and accent insensitive partial matching search.
+   * @param value             Query value of the string parameter
+   * @param modifier          Prefix to be handled
+   * @param path              Path to the target element to be queried
+   * @param targetType        FHIR Type of the target element
+   * @param targetReferences
+   * @return
+   */
   private def stringQuery(value:String, modifier:String,  path:String, targetType:String, targetReferences:Seq[String]  = Nil):Bson = {
     targetType match {
       case FHIR_DATA_TYPES.STRING =>
@@ -237,17 +243,18 @@ object SearchUtil {
   }
 
   /**
-    * A quantity parameter searches on the Quantity data type. The syntax for the
-    * value follows the form:
-    *
-    * [parameter]=[prefix][number]|[system]|[code] matches a quantity with the given unit
-    *
-    * @param quantity quantity parameter
-    * @param prefix prefix for the quantity parameter
-    * @param queryConfig Configuration for the corresponding search parameter
-    * @return equivalent BsonDocument for the target query
-    *
-    */
+   * A quantity parameter searches on the Quantity data type. The syntax for the
+   * value follows the form:
+   *
+   * [parameter]=[prefix][number]|[system]|[code] matches a quantity with the given unit
+   *
+   * @param quantity            quantity parameter
+   * @param prefix              prefix for the quantity parameter
+   * @param path                Path for the element
+   * @param targetType
+   * @param targetReferences
+   * @return
+   */
   private def quantityQuery(quantity:String, prefix:String, path:String, targetType:String, targetReferences:Seq[String] = Nil):Bson = {
     //Parse the given value
     val (value,system, code) = FHIRUtil.parseQuantityValue(quantity)
@@ -267,15 +274,36 @@ object SearchUtil {
           //Query on the quentity
           val valueQuery = PrefixModifierHandler.decimalPrefixHandler(FHIRUtil.mergeElementPath(queryPath, FHIR_COMMON_FIELDS.VALUE), value, prefix)
           //Also merge it with query on system and code
-          mergeValueQueryWithSystemCode(valueQuery, system, code, queryPath, FHIR_COMMON_FIELDS.SYSTEM, FHIR_COMMON_FIELDS.CODE, FHIR_COMMON_FIELDS.UNIT)
+          val sysCodeQuery = unitSystemCodeQuery(system, code, queryPath, FHIR_COMMON_FIELDS.SYSTEM, FHIR_COMMON_FIELDS.CODE, FHIR_COMMON_FIELDS.UNIT)
+          sysCodeQuery.map(sq => and(valueQuery, sq)).getOrElse(valueQuery)
+
+        case FHIR_DATA_TYPES.MONEY =>
+          //Query on the quatity
+          val valueQuery = PrefixModifierHandler.decimalPrefixHandler(FHIRUtil.mergeElementPath(queryPath, FHIR_COMMON_FIELDS.VALUE), value, prefix)
+          //Also merge it with query on currency code
+          val sysCodeQuery = code.map(c => Filters.eq(FHIRUtil.mergeElementPath(queryPath, FHIR_COMMON_FIELDS.CURRENCY), c))
+          sysCodeQuery.map(sq => and(valueQuery, sq)).getOrElse(valueQuery)
+
+        //Handle range
+        case FHIR_DATA_TYPES.RANGE =>
+          //Query on range values
+          val valueQuery = PrefixModifierHandler.rangePrefixHandler(queryPath.getOrElse(""), value, prefix)
+          val lowPath = FHIRUtil.mergeElementPath(queryPath, FHIR_COMMON_FIELDS.LOW)
+          val highPath =FHIRUtil.mergeElementPath(queryPath, FHIR_COMMON_FIELDS.HIGH)
+
+          val lq = unitSystemCodeQuery(system, code, Some(lowPath), FHIR_COMMON_FIELDS.SYSTEM, FHIR_COMMON_FIELDS.CODE, FHIR_COMMON_FIELDS.UNIT).map(sq => or(exists(lowPath, exists = false), sq))
+          val hq = unitSystemCodeQuery(system, code, Some(highPath), FHIR_COMMON_FIELDS.SYSTEM, FHIR_COMMON_FIELDS.CODE, FHIR_COMMON_FIELDS.UNIT).map(sq => or(exists(highPath, exists = false), sq))
+          //Merge all (both lq and hq should be SOME or NONE
+          lq.map(and(_, hq.get, valueQuery)).getOrElse(valueQuery)
 
         case FHIR_DATA_TYPES.SAMPLED_DATA =>
           //For SampleData, we should check for lowerLimit and upperLimit like a range query
-          val valueQuery = PrefixModifierHandler.rangePrefixHandler(FHIRUtil.mergeElementPath(queryPath, ""), value, prefix, isSampleData = true)
-          mergeValueQueryWithSystemCode(valueQuery, system, code, queryPath,
+          val valueQuery = PrefixModifierHandler.rangePrefixHandler(queryPath.getOrElse(""), value, prefix, isSampleData = true)
+          val sysCodeQuery = unitSystemCodeQuery(system, code, queryPath,
             systemPath = s"${FHIR_COMMON_FIELDS.ORIGIN}.${FHIR_COMMON_FIELDS.SYSTEM}",
             codePath=s"${FHIR_COMMON_FIELDS.ORIGIN}.${FHIR_COMMON_FIELDS.CODE}",
             unitPath= s"${FHIR_COMMON_FIELDS.ORIGIN}.${FHIR_COMMON_FIELDS.UNIT}")
+          sysCodeQuery.map(sq => and(valueQuery, sq)).getOrElse(valueQuery)
       }
 
     //If an array exist, use elemMatch otherwise return the query
@@ -287,7 +315,6 @@ object SearchUtil {
 
   /**
     * Merge the query ont the Quantity value with system and code restrictions
-    * @param valueQuery Query on Quantity.value
     * @param system Expected system
     * @param code Expected code/unit
     * @param queryPath Main path to the FHIR quantity element
@@ -296,15 +323,14 @@ object SearchUtil {
     * @param unitPath unit field path within the element
     * @return
     */
-  private def mergeValueQueryWithSystemCode(valueQuery:Bson, system:Option[String], code:Option[String], queryPath:Option[String], systemPath:String, codePath:String, unitPath:String):Bson = {
+  private def unitSystemCodeQuery(system:Option[String], code:Option[String], queryPath:Option[String], systemPath:String, codePath:String, unitPath:String):Option[Bson] = {
     (system, code) match {
       //Only query on value
       case (None, None) =>
-        valueQuery
+        None
       //Query on value + unit
       case (None, Some(c)) =>
-        and(
-          valueQuery,
+        Some(
           or(
             Filters.eq(FHIRUtil.mergeElementPath(queryPath, codePath), c),
             Filters.eq(FHIRUtil.mergeElementPath(queryPath, unitPath), c)
@@ -312,32 +338,35 @@ object SearchUtil {
         )
       //query on value + system + code
       case (Some(s), Some(c)) =>
-        and(
-          valueQuery,
-          Filters.eq(FHIRUtil.mergeElementPath(queryPath, codePath), c),
-          Filters.eq(FHIRUtil.mergeElementPath(queryPath, systemPath), s)
+        Some(
+          and(
+            Filters.eq(FHIRUtil.mergeElementPath(queryPath, codePath), c),
+            Filters.eq(FHIRUtil.mergeElementPath(queryPath, systemPath), s)
+          )
         )
       case _ => throw new InternalServerException("Invalid state!")
     }
   }
 
   /**
-    * A reference parameter refers to references between resources. The interpretation of a reference
-    * parameter is either:
-    *
-    * [parameter]=[id] the logical [id] of a resource using a local reference (i.e. a relative reference)
-    *
-    * [parameter]=[type]/[id] the logical [id] of a resource of a specified type using
-    * a local reference (i.e. a relative reference), for when the reference can point to different
-    * types of resources (e.g. Observation.subject)
-    *
-    * [parameter]=[url] where the [url] is an absolute URL - a reference to a resource by its absolute location
-    *
-    * @param reference a reference to be handled
-    * @param modifier type of the reference(e.g. :type modifier)
-    * @param queryConfig Configuration for the corresponding search parameter
-    * @return equivalent BsonDocument for the target query
-    */
+   * A reference parameter refers to references between resources. The interpretation of a reference
+   * parameter is either:
+   *
+   * [parameter]=[id] the logical [id] of a resource using a local reference (i.e. a relative reference)
+   *
+   * [parameter]=[type]/[id] the logical [id] of a resource of a specified type using
+   * a local reference (i.e. a relative reference), for when the reference can point to different
+   * types of resources (e.g. Observation.subject)
+   *
+   * [parameter]=[url] where the [url] is an absolute URL - a reference to a resource by its absolute location
+   *
+   * @param reference               a reference to be handled
+   * @param modifier                type of the reference(e.g. :type modifier)
+   * @param path                    path to the element
+   * @param targetType
+   * @param targetReferenceTypes    Target reference types
+   * @return                        equivalent BsonDocument for the target query
+   */
   private def referenceQuery(reference:String, modifier:String, path:String, targetType:String, targetReferenceTypes:Seq[String]):Bson = {
     targetType match {
       //If this is a search on a FHIR Reference type element
@@ -401,12 +430,64 @@ object SearchUtil {
             val (canonicalUrl, canonicalVersion) = FHIRUtil.parseCanonicalValue(reference)
             canonicalVersion match{
               case None => //Otherwise should match any version
+
                 regex(FHIRUtil.normalizeElementPath(path), "\\A" + FHIRUtil.escapeCharacters(canonicalUrl) + "(\\|[0-9]+(\\.[0-9]*)*)?$")
               case Some(_) => // Exact match if version exist
                 Filters.eq(FHIRUtil.normalizeElementPath(path), reference)
             }
 
         }
+    }
+  }
+
+  /**
+   *
+   * @param pathParts
+   * @param restrictionsWithIndexes
+   * @param value
+   * @param paramType
+   * @param targetType
+   * @param modifierOrPrefix
+   * @param targetReferences
+   * @return
+   */
+  def queryWithRestrictions(pathParts:Seq[String], restrictionsWithIndexes:Seq[(Int, Seq[(String,String)])], value:String,  paramType:String, targetType:String, modifierOrPrefix:String, targetReferences:Seq[String]):Bson = {
+    val restriction = restrictionsWithIndexes.head
+    val parentPath = pathParts.slice(0, restriction._1 + 1).mkString(".")
+    //Find childpaths
+    val childPaths = pathParts.drop(restriction._1 + 1)
+    //Split the parent path
+    val (elemMatchPath,  queryPath) = FHIRUtil.splitElementPathIntoElemMatchAndQueryPaths(parentPath)
+
+    if(restrictionsWithIndexes.tail.isEmpty){
+      val childPath = childPaths.mkString(".")
+      val mainQuery =
+        and(
+            (
+              //Restriction queries
+              restriction._2.map(r => Filters.eq(FHIRUtil.mergeElementPath(queryPath, r._1), r._2)) :+
+              //Actual query
+              SearchUtil
+                .typeHandlerFunction(paramType)(value, modifierOrPrefix, FHIRUtil.mergeElementPath(queryPath, childPath), targetType, targetReferences),
+            ):_*
+        )
+      //Apply elem match
+      elemMatchPath match {
+        case None => mainQuery
+        case Some(emp) => elemMatch(emp, mainQuery)
+      }
+    }
+    //If there are still restrictions on child paths
+    else {
+      val mainQuery =
+        and(
+          (
+            //Restriction queries
+            restriction._2.map(r => Filters.eq(FHIRUtil.mergeElementPath(queryPath, r._1), r._2)) :+
+            queryWithRestrictions(childPaths,restrictionsWithIndexes.tail, value, paramType, targetType, modifierOrPrefix, targetReferences)
+            ):_*
+        )
+      elemMatch(elemMatchPath.get, mainQuery)
     }
   }
 

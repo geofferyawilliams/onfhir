@@ -1,5 +1,7 @@
 package io.onfhir.db
 
+import java.time.Instant
+
 import akka.http.scaladsl.model.{DateTime, StatusCode, StatusCodes}
 import io.onfhir.Onfhir
 import io.onfhir.api._
@@ -7,12 +9,14 @@ import io.onfhir.api.model.Parameter
 import io.onfhir.api.parsers.FHIRResultParameterResolver
 import io.onfhir.api.util.FHIRUtil
 import io.onfhir.config.FhirConfigurationManager.fhirConfig
-import io.onfhir.config.OnfhirConfig
+import io.onfhir.config.{FhirConfigurationManager, OnfhirConfig, SearchParameterConf}
 import org.mongodb.scala.bson.collection.immutable.Document
 import org.mongodb.scala.bson.conversions.Bson
 import io.onfhir.db.BsonTransformer._
 import io.onfhir.event.{FhirEventBus, ResourceCreated, ResourceDeleted, ResourceUpdated}
-import io.onfhir.exception.UnsupportedParameterException
+import io.onfhir.exception.{BadRequestException, InternalServerException, UnsupportedParameterException}
+import io.onfhir.util.DateTimeUtil
+import org.json4s.JsonAST.JValue
 import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -152,6 +156,125 @@ object ResourceManager {
   }
 
   /**
+   * Execute the given query and return last or first n resources (based on sorting params) for each group determined by groupByParams
+   * e.g. Query the last 3 observations for each observation code given in the query of a given patient
+   *
+   * @param rtype              Resource type to query
+   * @param parameters         FHIR Search parameters e.g. ?subject=Patient/...&code=1235-4,35864-7,65668-8
+   * @param sortingParams      Sorting FHIR search parameters to sort the results for last or first n selection e.g. date
+   * @param groupByParams      FHIR search parameters to indicate the group by expression e.g. code
+   * @param lastOrFirstN       Number of last/first results to return for each group;
+   *                            - negative value means last e.g -2 --> last 2
+   *                            - positive value means first e.g. 3 --> first 3
+   * @param excludeExtraFields If true, extra fields are cleared
+   * @param transactionSession Session if this is part of a transaction
+   * @return                   Bucket keys and results for each group , all included or revincluded resources
+   */
+  def searchLastOrFirstNResources(rtype:String,
+                                 parameters:List[Parameter] = List.empty,
+                                 sortingParams:List[String],
+                                 groupByParams:List[String],
+                                 lastOrFirstN:Int = -1,
+                                 excludeExtraFields:Boolean = false)(implicit transactionSession: Option[TransactionSession] = None):Future[(Seq[(Map[String, JValue], Seq[Resource])], Seq[Resource])] = {
+
+    if(sortingParams.isEmpty || groupByParams.isEmpty)
+      throw new RuntimeException(s"Parameters  sortingFields or groupByParams is empty! They are required for this method 'queryLastOrFirstNResources'")
+
+    //Extract FHIR result parameters
+    val resultParameters = parameters.filter(_.paramCategory == FHIR_PARAMETER_CATEGORIES.RESULT)
+    //Check _summary param to identify what to include or exclude
+    val summaryIncludesOrExcludes =  FHIRResultParameterResolver.resolveSummaryParameter(rtype, resultParameters)
+    //Check _elements param to include further
+    val elementsIncludes = FHIRResultParameterResolver.resolveElementsParameter(resultParameters)
+    //Decide on final includes and excludes
+    val finalIncludesOrExcludes = if(elementsIncludes.nonEmpty) Some(true -> elementsIncludes) else summaryIncludesOrExcludes
+
+    //Find out include and revinclude params
+    val includeParams = resultParameters.filter(_.name == FHIR_SEARCH_RESULT_PARAMETERS.INCLUDE)
+    val revIncludeParams = resultParameters.filter(_.name == FHIR_SEARCH_RESULT_PARAMETERS.REVINCLUDE)
+
+    //other result parameters are ignored as they are not relevant
+
+
+    //Now others are query parameters
+    val queryParams = parameters.filter(_.paramCategory !=  FHIR_PARAMETER_CATEGORIES.RESULT)
+
+    //Run the search
+    constructQuery(rtype, queryParams).flatMap {
+      //If there is no query, although there are parameters
+      case None if queryParams.nonEmpty => Future.apply(Nil-> Nil)
+      //Otherwise process groupBy and sorting parameters and execute the query
+      case finalQuery =>
+        //Find out paths for each sorting parameter
+        val finalSortingPaths:Seq[(String, Seq[String])] =
+          sortingParams
+            .map(sp => fhirConfig.findSupportedSearchParameter(rtype, sp) match {
+              case None =>
+                throw new UnsupportedParameterException(s"Search parameter ${sp} is not supported for resource type $rtype, or you can not use it for sorting! Check conformance statement of server!")
+              case Some(spConf) =>
+                spConf.pname ->
+                  spConf
+                    .extractElementPathsAndTargetTypes()
+                    .flatMap { case (path, ttype) =>
+                      SORTING_SUBPATHS
+                        .getOrElse(ttype, Seq("")) //Get the subpaths for sorting for the target element type
+                        .map(subpath => path + subpath)
+                    }
+            })
+
+        //Construct expressions for groupBy params
+        val groupByParamConfs =
+          groupByParams
+          .map(gbyp =>
+            fhirConfig.findSupportedSearchParameter(rtype, gbyp) match {
+              case None =>
+                throw new UnsupportedParameterException(s"Search parameter ${gbyp} is not supported for resource type $rtype, or you can not use it for grouping! Check conformance statement of server!")
+              case Some(gbypConf) => gbypConf
+            }
+          )
+
+      val groupByExpressions = AggregationHandler.constructGroupByExpression(groupByParamConfs, parameters)
+
+      //Execute the query and find the matched results
+      val fResults =
+        DocumentManager
+        .searchLastOrFirstNByAggregation(rtype, finalQuery, lastOrFirstN,finalSortingPaths, groupByExpressions)
+        .map(results =>
+          results.map(r => {
+            val keys =
+              groupByParams.map(p =>
+                p -> r._1.get(p).get.fromBson
+              ).toMap
+            keys -> r._2.map(_.fromBson)
+          })
+        )
+
+       fResults.flatMap(matchedResources =>
+       //Handle _include and _revinclude params
+        (includeParams, revIncludeParams) match {
+          //No _include or _revinclude
+          case (Nil, Nil) => Future.apply(matchedResources, Seq.empty)
+          //Only _revinclude
+          case (Nil, _) =>
+            handleRevIncludes(rtype, matchedResources.flatMap(_._2), revIncludeParams)
+              .map(revIncludedResources => (matchedResources, revIncludedResources))
+          //Only _include
+          case (_, Nil) =>
+            handleIncludes(rtype, matchedResources.flatMap(_._2), includeParams)
+              .map(includedResources => (matchedResources, includedResources))
+          //Both
+          case (_, _) =>
+            val allMatchedResources = matchedResources.flatMap(_._2)
+            for {
+              includedResources <- handleIncludes(rtype, allMatchedResources, includeParams)
+              revIncludedResources <- handleRevIncludes(rtype, allMatchedResources, revIncludeParams)
+            } yield (matchedResources, includedResources ++ revIncludedResources)
+        }
+       )
+    }
+  }
+
+  /**
     * Construct alternative paths according to FHIR type of the target element
     * @param sortingFields  Sorting fields (param name, sorting direction, path and target resource type
     * @return
@@ -194,7 +317,7 @@ object ResourceManager {
     * @param queryParams  Parsed FHIR query parameter
     * @return None if the query fails (no matching resources) otherwise final Mongo query
     */
-  private def constructQuery(rtype:String, queryParams:List[Parameter] = List.empty)(implicit transactionSession: Option[TransactionSession] = None):Future[Option[Bson]] = {
+  def constructQuery(rtype:String, queryParams:List[Parameter] = List.empty)(implicit transactionSession: Option[TransactionSession] = None):Future[Option[Bson]] = {
     //Handle Special params
     val specialParamQueries:Future[Seq[Option[Bson]]] = handleSpecialParams(rtype, queryParams.filter(_.paramCategory == FHIR_PARAMETER_CATEGORIES.SPECIAL))
     //Handle Chained Params
@@ -240,7 +363,6 @@ object ResourceManager {
       }
     })
   }
-
 
   /**
     * Handle FHIR _revinclude to return revinclude resources
@@ -347,17 +469,8 @@ object ResourceManager {
         //Find the path to the FHIR Reference elements
         val refPath:Option[String] =
           refParamConf.flatMap(pconf => {
-            //If on extension actual path is the last one
-            if(pconf.onExtension)
-              if (targetResourceType.forall(t => pconf.targets.contains(t) || pconf.targets.contains(FHIR_DATA_TYPES.RESOURCE)))
-                Some(pconf.paths.last.asInstanceOf[(String, String)]._1)
-              else
-                None
-             else if(pconf.paths.length == 1 && pconf.paths.head.isInstanceOf[String])
-              if(targetResourceType.forall(t => pconf.targets.contains(t) || pconf.targets.contains(FHIR_DATA_TYPES.RESOURCE)))
-                Some(pconf.extractElementPaths().head)
-              else
-                None
+            if (targetResourceType.forall(t => pconf.targets.contains(t) || pconf.targets.contains(FHIR_DATA_TYPES.RESOURCE)))
+              Some(pconf.extractElementPaths().head)
             else
               None
           })
@@ -452,7 +565,7 @@ object ResourceManager {
       throw new UnsupportedParameterException(s"Parameter ${parameter.chain.last._2} is not supported on $rtypeToQuery within '_has' query!")
 
     //Find the paths of reference element to return
-    val referencePaths = chainParameterConf.get.extractElementPaths()
+    val referencePaths = chainParameterConf.get.extractElementPaths().toSet
     //Run query but only return the references on chain parameter
     var fresourceReferences = DocumentManager
       .searchDocuments(rtypeToQuery, Some(query), includingOrExcludingFields = Some(true -> referencePaths))
@@ -506,7 +619,7 @@ object ResourceManager {
         throw new UnsupportedParameterException(s"Parameter ${rtypeAndChainParamName._2} is not supported on ${rtypeAndChainParamName._1} within '_has' query!")
 
       //Find the paths of reference element to return
-      val referencePaths = chainParameterConf.get.extractElementPaths()
+      val referencePaths = chainParameterConf.get.extractElementPaths().toSet
       //Go and get the references inside the given resources
       getResourcesWithIds(rtypeAndChainParamName._1, rids, Some(true -> referencePaths), excludeExtraFields = true)
         .map(
@@ -654,7 +767,7 @@ object ResourceManager {
     PrefixModifierHandler.dateRangePrefixHandler(
       s"${FHIR_COMMON_FIELDS.META}.${FHIR_COMMON_FIELDS.LAST_UPDATED}",
       atTime,
-      FHIR_PREFIXES_MODIFIERS.EQUAL)
+      FHIR_PREFIXES_MODIFIERS.LESS_THAN)
 
 
   /**
@@ -668,15 +781,25 @@ object ResourceManager {
     //Resolve history parameters
     val since = searchParameters.find(_.name == FHIR_SEARCH_RESULT_PARAMETERS.SINCE).map(_.valuePrefixList.head._2)
     val at = searchParameters.find(_.name == FHIR_SEARCH_RESULT_PARAMETERS.AT).map(_.valuePrefixList.head._2)
-    val list = searchParameters.find(_.name == FHIR_SEARCH_SPECIAL_PARAMETERS.LIST).map(_.valuePrefixList.head._2)
+
     val (page, count) = FHIRResultParameterResolver.resolveCountPageParameters(searchParameters)
 
-    //Construct query
-    //TODO handle list query
-    val query = DocumentManager.andQueries(since.map(sinceQuery).toSeq ++ at.map(atQuery).toSeq)
+    val listQueryFuture = searchParameters.find(_.name == FHIR_SEARCH_SPECIAL_PARAMETERS.LIST) match {
+      case None => Future.apply(None)
+      case Some(p) => handleListSearch(rtype, p)
+    }
 
-    DocumentManager
-      .searchHistoricDocuments(rtype, rid, query, count, page)
+    val result = listQueryFuture flatMap(listQuery => {
+      if(at.isDefined){
+        val finalQuery = DocumentManager.andQueries(listQuery.toSeq :+ atQuery(at.get))
+        DocumentManager.searchHistoricDocumentsWithAt(rtype, rid, finalQuery, count, page)
+      } else {
+        val finalQuery = DocumentManager.andQueries(since.map(sinceQuery).toSeq ++ listQuery.toSeq)
+        DocumentManager.searchHistoricDocuments(rtype, rid, finalQuery, count, page)
+      }
+    })
+
+    result
       .map {
         case (total, docs) => total -> docs.map(_.fromBson)
       }
@@ -714,7 +837,7 @@ object ResourceManager {
   def createResource(rtype:String, resource:Resource, generatedId:Option[String] = None, withUpdate:Boolean = false)(implicit transactionSession: Option[TransactionSession] = None):Future[(String, Long, DateTime, Resource)] = {
     //1) set resource version and last update time
     val newVersion   = 1L                                                     //new version is always 1 for create operation
-    val lastModified = DateTime.now                                           //last modified will be "now"
+    val lastModified = Instant.now()                                          //last modified will be "now"
     val newId        = generatedId.getOrElse(FHIRUtil.generateResourceId())   //generate an identifier for the new resource
     val resourceWithMeta = FHIRUtil.populateResourceWithMeta(resource, Some(newId), newVersion, lastModified)
 
@@ -730,7 +853,7 @@ object ResourceManager {
       .insertDocument(rtype, Document(populatedResource.toBson))
       .map( c => resourceCreated(rtype, newId, resourceWithMeta)) //trigger the event
       .map( _ =>
-        (newId, newVersion, lastModified, resourceWithMeta)
+        (newId, newVersion, DateTimeUtil.instantToDateTime(lastModified), resourceWithMeta)
       )
   }
 
@@ -742,7 +865,7 @@ object ResourceManager {
     */
   def createResources(rtype:String, resources:Map[String, Resource]):Future[Seq[Resource]] = {
     val newVersion   = 1L                                                     //new version is always 1 for create operation
-    val lastModified = DateTime.now                                           //last modified will be "now"
+    val lastModified = Instant.now()                                          //last modified will be "now"
     val resourcesWithMeta = resources.map {
       case (rid, resource) => FHIRUtil.populateResourceWithMeta(resource, Some(rid), newVersion, lastModified)
     }.toSeq
@@ -791,13 +914,14 @@ object ResourceManager {
     * @param resource Updated resource
     * @param previousVersion Previous version of the document together with version id
     * @param wasDeleted If previously, this was deleted resource
+    * @param silentEvent  If true, ResourceUpdate event is not triggered (used internally)
     * @param transactionSession
     * @return
     */
-  def updateResource(rtype:String, rid:String, resource:Resource, previousVersion:(Long, Resource), wasDeleted :Boolean = false)(implicit transactionSession: Option[TransactionSession] = None):Future[(Long, DateTime, Resource)] = {
+  def updateResource(rtype:String, rid:String, resource:Resource, previousVersion:(Long, Resource), wasDeleted :Boolean = false, silentEvent:Boolean = false)(implicit transactionSession: Option[TransactionSession] = None):Future[(Long, DateTime, Resource)] = {
     //1) Update the resource version and last update time
     val newVersion   = previousVersion._1 + 1L   //new version always be 1 incremented of current version
-    val lastModified = DateTime.now           //last modified will be "now"
+    val lastModified = Instant.now()             //last modified will be "now"
     val resourceWithMeta = FHIRUtil.populateResourceWithMeta(resource, Some(rid), newVersion, lastModified)
 
     //2) Add "current" field with value. (after serializing to json)
@@ -820,13 +944,17 @@ object ResourceManager {
         DocumentManager
           .replaceCurrent(rtype, rid, Document(populatedResource.toBson), shardQueryOpt)
 
-    fop
-      .map( c => resourceUpdated(rtype, rid, resource)) //trigger the event
-      .map( _ =>
-        (newVersion, lastModified, resourceWithMeta)
+    if(silentEvent)
+      fop.map(_ =>
+        (newVersion, DateTimeUtil.instantToDateTime(lastModified), resourceWithMeta)
       )
+    else
+      fop
+        .map( c => resourceUpdated(rtype, rid, resource)) //trigger the event
+        .map( _ =>
+          (newVersion, DateTimeUtil.instantToDateTime(lastModified), resourceWithMeta)
+        )
   }
-
 
 
   /*/***
@@ -863,7 +991,7 @@ object ResourceManager {
   def deleteResource(rtype:String, rid:String, previousVersion:(Long, Resource), statusCode:StatusCode = StatusCodes.NoContent)(implicit transactionSession: Option[TransactionSession] = None):Future[(Long, DateTime)]  = {
     //1) Create a empty document to represent deletion
     val newVersion     = previousVersion._1 + 1L   //new version is 1 incremented
-    val lastModified = DateTime.now
+    val lastModified = Instant.now()
 
     //2) Construct shard query if sharding is enabled and on a field other than id
     val shardQueryOpt = ResourceQueryBuilder.constructShardingQuery(rtype, previousVersion._2)
@@ -884,7 +1012,7 @@ object ResourceManager {
      fop
       .map( _ => resourceDeleted(rtype, rid)) //trigger the event
       .map( _ =>
-        (newVersion, lastModified)
+        (newVersion, DateTimeUtil.instantToDateTime(lastModified))
       )
   }
 

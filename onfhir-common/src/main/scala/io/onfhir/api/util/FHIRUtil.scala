@@ -1,16 +1,21 @@
 package io.onfhir.api.util
 
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.UUID
 
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.`Content-Type`
-import io.onfhir.config.OnfhirConfig
+import com.nimbusds.jose.util.Base64URL
+import io.onfhir.config.{OnfhirConfig, OperationParamDef}
 import io.onfhir.api._
-import io.onfhir.api.model.{FHIRResponse, Parameter}
+import io.onfhir.api.model.{FHIRMultiOperationParam, FHIROperationParam, FHIRResponse, FHIRSimpleOperationParam, FhirCanonicalReference, FhirInternalReference, FhirLiteralReference, FhirLogicalReference, FhirReference, Parameter}
 import io.onfhir.api.parsers.FHIRResultParameterResolver
 import io.onfhir.util.JsonFormatter.formats
 import io.onfhir.config.FhirConfigurationManager.fhirConfig
 import io.onfhir.exception.InvalidParameterException
+import io.onfhir.util.DateTimeUtil
 import org.json4s.JsonAST.{JNothing, JObject, JValue}
 import org.json4s.JsonDSL._
 import org.json4s.{JsonAST, _}
@@ -85,31 +90,33 @@ object FHIRUtil {
     location = if(otherParametersExceptPage.isEmpty) location + "?" else location + "&"
 
     //If we don't calculate the total count in search, then does not return last link
-    if (totalCount == -1) {
-      val previousPage = page - 1
-      List(
-        Some(FHIR_BUNDLE_FIELDS.SELF_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$page"),
-        Some(FHIR_BUNDLE_FIELDS.FIRST_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=1"),
-        Some(FHIR_BUNDLE_FIELDS.NEXT_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=${page + 1}"),
-        if (previousPage > 0) Some(FHIR_BUNDLE_FIELDS.PREVIOUS_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$previousPage") else None
-      ).filter(_.isDefined).map(_.get)
-    }
-    else if (totalCount < count) {
-      List(FHIR_BUNDLE_FIELDS.SELF_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$page") //Only return self link if there is no previous or next
-    } else {
-      //Find next, last and previous pages in FHIR paging
-      val lastPage = if (totalCount % count == 0) totalCount / count else totalCount / count + 1
-      val nextPage = page.toInt + 1
-      val previousPage = page.toInt - 1
+    val links =
+      if (totalCount == -1) {
+        val previousPage = page - 1
+        List(
+          Some(FHIR_BUNDLE_FIELDS.SELF_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$page"),
+          Some(FHIR_BUNDLE_FIELDS.FIRST_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=1"),
+          Some(FHIR_BUNDLE_FIELDS.NEXT_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=${page + 1}"),
+          if (previousPage > 0) Some(FHIR_BUNDLE_FIELDS.PREVIOUS_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$previousPage") else None
+        ).filter(_.isDefined).map(_.get)
+      }
+      else if (totalCount < count) {
+        List(FHIR_BUNDLE_FIELDS.SELF_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$page") //Only return self link if there is no previous or next
+      } else {
+        //Find next, last and previous pages in FHIR paging
+        val lastPage = if (totalCount % count == 0) totalCount / count else totalCount / count + 1
+        val nextPage = page.toInt + 1
+        val previousPage = page.toInt - 1
 
-      List(
-        Some(FHIR_BUNDLE_FIELDS.SELF_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$page"),
-        Some(FHIR_BUNDLE_FIELDS.FIRST_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=1"), //First is always page 1
-        if (nextPage <= lastPage) Some(FHIR_BUNDLE_FIELDS.NEXT_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$nextPage") else None, //Put next page if this is not last page
-        if (previousPage > 0) Some(FHIR_BUNDLE_FIELDS.PREVIOUS_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$previousPage") else None, //Put previous page if this is not first page
-        Some(FHIR_BUNDLE_FIELDS.LAST_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$lastPage") //Set the last page
-      ).filter(_.isDefined).map(_.get)
-    }
+        List(
+          Some(FHIR_BUNDLE_FIELDS.SELF_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$page"),
+          Some(FHIR_BUNDLE_FIELDS.FIRST_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=1"), //First is always page 1
+          if (nextPage <= lastPage) Some(FHIR_BUNDLE_FIELDS.NEXT_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$nextPage") else None, //Put next page if this is not last page
+          if (previousPage > 0) Some(FHIR_BUNDLE_FIELDS.PREVIOUS_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$previousPage") else None, //Put previous page if this is not first page
+          Some(FHIR_BUNDLE_FIELDS.LAST_LINK -> s"$location${FHIR_SEARCH_RESULT_PARAMETERS.PAGE}=$lastPage") //Set the last page
+        ).filter(_.isDefined).map(_.get)
+      }
+    links
   }
 
   /**
@@ -168,7 +175,7 @@ object FHIRUtil {
               p.valuePrefixList.map(vp => vp._1 + vp._2).mkString(",")
 
           //Return name and value part
-          namePart + "=" + valuePart
+          namePart + "=" + URLEncoder.encode(valuePart, StandardCharsets.UTF_8.toString)
         }).mkString("&")
       else
         ""//No parameter
@@ -221,18 +228,29 @@ object FHIRUtil {
     * @param lastModified last modified information of the resource
     * @return
     */
-  def populateResourceWithMeta(resource: Resource, id: Option[String], versionId: Long, lastModified: DateTime): Resource = {
-    var result:Resource = resource
-    //Put id
-    if (id.isDefined) result = result merge (JObject() ~ (FHIR_COMMON_FIELDS.ID -> id.get)) //add id field to resource
-    //Generate meta if not exist
-    val meta:Resource =
-      (FHIR_COMMON_FIELDS.META ->
-        (FHIR_COMMON_FIELDS.VERSION_ID -> versionId.toString) ~
-        (FHIR_COMMON_FIELDS.LAST_UPDATED -> (lastModified.toIsoDateTimeString + "Z"))
-      )
+  def populateResourceWithMeta(resource: Resource, id: Option[String], versionId: Long, lastModified: Instant): Resource = {
+    val resourceTypeField = resource.findField(_._1 == FHIR_COMMON_FIELDS.RESOURCE_TYPE).get
+
+    val meta:Resource = (resource \ FHIR_COMMON_FIELDS.META)  match {
+      case meta:JObject =>
+        FHIR_COMMON_FIELDS.META -> (meta merge ((FHIR_COMMON_FIELDS.VERSION_ID -> versionId.toString) ~ (FHIR_COMMON_FIELDS.LAST_UPDATED -> DateTimeUtil.serializeInstant(lastModified))))
+      case _  =>
+        (FHIR_COMMON_FIELDS.META ->
+          (FHIR_COMMON_FIELDS.VERSION_ID -> versionId.toString) ~
+            (FHIR_COMMON_FIELDS.LAST_UPDATED -> DateTimeUtil.serializeInstant(lastModified))
+          )
+    }
+
+    var result:Resource = resource.obj.filterNot(f => f._1 == FHIR_COMMON_FIELDS.ID || f._1 == FHIR_COMMON_FIELDS.META || f._1 == FHIR_COMMON_FIELDS.RESOURCE_TYPE)
+
     //Merge it
-    result = result merge meta
+    result = meta merge result
+
+    //Put id
+    if (id.isDefined)
+      result = (JObject() ~ (FHIR_COMMON_FIELDS.ID -> id.get)) merge result  //add id field to resource
+
+    result = resourceTypeField ~ result
     result
   }
 
@@ -267,7 +285,7 @@ object FHIRUtil {
   def setProfile(resource: Resource, profile:String):Resource = {
     val meta:Resource =
       (FHIR_COMMON_FIELDS.META ->
-        (FHIR_COMMON_FIELDS.PROFILE -> profile)
+        (FHIR_COMMON_FIELDS.PROFILE -> JArray(List(JString(profile))))
         )
 
     resource merge meta
@@ -289,13 +307,13 @@ object FHIRUtil {
     * @param prefer   value of the prefer header
     * @return a string in json format
     */
-  def getResourceContentByPreference(resource: Resource, prefer: Option[String]): Resource = {
+  def getResourceContentByPreference(resource: Resource, prefer: Option[String]): Option[Resource] = {
     prefer.getOrElse(OnfhirConfig.fhirDefaultReturnPreference) match {
-      case preferHeader if preferHeader.contains(FHIR_HTTP_OPTIONS.FHIR_RETURN_MINIMAL) =>  JObject() //if return=minimal send empty string
-      case preferHeader if preferHeader.contains(FHIR_HTTP_OPTIONS.FHIR_RETURN_REPRESENTATION) => resource//resource.clone() //if return=representation send whole resource back
-      case preferHeader if preferHeader.contains(FHIR_HTTP_OPTIONS.FHIR_RETURN_OPERATION_OUTCOME)=> FHIRResponse.createOperationOutcomeWithSuccess()
+      case preferHeader if preferHeader.contains(FHIR_HTTP_OPTIONS.FHIR_RETURN_MINIMAL) =>  None //if return=minimal send empty string
+      case preferHeader if preferHeader.contains(FHIR_HTTP_OPTIONS.FHIR_RETURN_REPRESENTATION) => Some(resource)//resource.clone() //if return=representation send whole resource back
+      case preferHeader if preferHeader.contains(FHIR_HTTP_OPTIONS.FHIR_RETURN_OPERATION_OUTCOME)=> Some(FHIRResponse.createOperationOutcomeWithSuccess())
       case _ =>
-        resource//resource.clone() // Default representation
+        Some(resource)//resource.clone() // Default representation
     }
   }
 
@@ -396,7 +414,10 @@ object FHIRUtil {
         entry = entry ~
           (FHIR_BUNDLE_FIELDS.REQUEST ->
               (FHIR_COMMON_FIELDS.METHOD -> method.get) ~
-              (FHIR_COMMON_FIELDS.URL -> resourceUrl)
+              (FHIR_COMMON_FIELDS.URL ->  (method.get match {
+                case FHIR_METHOD_NAMES.METHOD_POST => resourceType
+                case FHIR_METHOD_NAMES.METHOD_PUT | FHIR_METHOD_NAMES.METHOD_DELETE => resourceType + "/" +  resourceId
+              }))
           )
       }
 
@@ -477,7 +498,7 @@ object FHIRUtil {
     */
   def extractLastUpdatedFromResource(resource: Resource): DateTime = {
     val lastUpdatedString = (resource \ FHIR_COMMON_FIELDS.META \ FHIR_COMMON_FIELDS.LAST_UPDATED).extract[String]
-    DateTime.fromIsoDateTimeString(lastUpdatedString.dropRight(1)).get
+    DateTimeUtil.parseInstant(lastUpdatedString).get
   }
 
   /***
@@ -558,7 +579,7 @@ object FHIRUtil {
   /**
     * Extract all paths of the search parameter for the given resource type
     * @param _type Resource type
-    * @param parameterName Parameter name
+    * @param parameter Parsed Search Parameter value
     * @return the paths defined for the parameter for the resource  type
     */
   def extractElementPaths(_type: String, parameter:Parameter):Set[String] = {
@@ -566,10 +587,10 @@ object FHIRUtil {
       case FHIR_PARAMETER_CATEGORIES.COMPARTMENT =>
         val compartmentRelatedParams = parameter.chain.map(_._2)
         compartmentRelatedParams.map(p =>
-          fhirConfig.findSupportedSearchParameter(_type, p).map(_.extractElementPaths()).getOrElse(Set.empty)
-        ).reduce((s1,s2)=> s1++s2)
+          fhirConfig.findSupportedSearchParameter(_type, p).map(_.extractElementPaths()).getOrElse(Nil)
+        ).reduce((s1,s2)=> s1++s2).toSet
       case FHIR_PARAMETER_CATEGORIES.NORMAL =>
-        fhirConfig.findSupportedSearchParameter(_type, parameter.name).map(_.extractElementPaths()).getOrElse(Set.empty)
+        fhirConfig.findSupportedSearchParameter(_type, parameter.name).map(_.extractElementPaths()).getOrElse(Nil).toSet
       //Other parameters are not important
       case _ => Set.empty
     }
@@ -629,51 +650,6 @@ object FHIRUtil {
             .find(mediaType => filteredRanges.map(mediaRange => mediaRange.matches(mediaType)).fold(false)(_ | _))*/
         }
     }
-  }
-
-
-
-  /**
-    * Return the FHIR Parameter object (within FHIR Parameters Resource) given with the name from Parameters resource
-    * @param name
-    * @return
-    */
-  private def getParametersByName(parametersResource:Resource, name:String):Seq[Resource] = {
-    parametersResource \ FHIR_COMMON_FIELDS.PARAMETER match {
-      case JArray(values) => values.filter(p => (p \ FHIR_COMMON_FIELDS.NAME).extract[String] == name).map(_.asInstanceOf[JObject])
-      case _ => Nil
-    }
-  }
-
-  /**
-    * Return the parameter value from the parameter object (BackboneElement in Parameters definition) given parameter type as JValue
-    * @param parameter
-    * @param valueType
-    * @return
-    */
-  private def getParameterValueByType(parameter:Resource, valueType:String):Option[JValue] = {
-    val found = valueType match {
-      case "Resource" => parameter \ FHIR_COMMON_FIELDS.RESOURCE //Any resource
-      case dt if FHIR_ALL_DATA_TYPES.contains(valueType) =>
-        parameter \ s"value${valueType.capitalize}"
-      case  _ => parameter \ FHIR_COMMON_FIELDS.RESOURCE //Resource types
-    }
-    found match {
-      case JNothing => None
-      case other => Some(other)
-    }
-  }
-
-  /**
-    * Return the value of parameter from the Parameters resource given name and type of parameter
-    * @param parametersResource
-    * @param pname
-    * @param ptype
-    * @return
-    */
-  def getParameterValue(parametersResource:Resource, pname:String, ptype:String): Seq[JValue] ={
-    getParametersByName(parametersResource, pname)
-      .flatMap(getParameterValueByType(_, ptype))
   }
 
  /* /**
@@ -736,6 +712,47 @@ object FHIRUtil {
   def extractReferences(refPath:String, resource: Resource):Seq[String] = {
       applySearchParameterPath(refPath, resource)
         .flatMap(refObj => (refObj \ FHIR_COMMON_FIELDS.REFERENCE).extractOpt[String])
+  }
+
+  /**
+   * Parse a canononical reference value
+   * @param c
+   * @return
+   */
+  def parseCanonicalReference(c:String):FhirCanonicalReference = {
+    val urlAndFragment = c.split('#')
+    val urlAndVersion = urlAndFragment.head.split('|')
+    val urlFragments = urlAndVersion.head.split('/')
+
+    FhirCanonicalReference(
+      urlFragments.dropRight(2).mkString("/"),
+      urlFragments.dropRight(1).last,
+      urlFragments.last,
+      urlAndVersion.drop(1).headOption,
+      urlAndFragment.drop(1).headOption
+    )
+  }
+  /**
+   * Parse a FHIR Reference or Canonical element
+   * @param value
+   * @return
+   */
+  def parseReference(value:JValue):FhirReference = {
+    value match {
+      case obj:JObject =>
+        FHIRUtil.extractValueOption[String](obj, FHIR_COMMON_FIELDS.REFERENCE) match {
+          case Some(fhirReferenceUrl) if fhirReferenceUrl.startsWith("#") => FhirInternalReference(fhirReferenceUrl.drop(1))
+          case Some(fhirReferenceUrl) if !fhirReferenceUrl.startsWith("#") =>
+            var r = parseReferenceValue(fhirReferenceUrl)
+            FhirLiteralReference(r._1, r._2, r._3, r._4)
+          case None =>
+            val referencedResourceType = FHIRUtil.extractValueOption[String](obj, FHIR_COMMON_FIELDS.TYPE)
+            val refIdentifier = FHIRUtil.extractValueOption[JObject](obj, FHIR_COMMON_FIELDS.IDENTIFIER).get
+            FhirLogicalReference(referencedResourceType, FHIRUtil.extractValueOption[String](refIdentifier, FHIR_COMMON_FIELDS.SYSTEM), FHIRUtil.extractValue[String](refIdentifier, FHIR_COMMON_FIELDS.VALUE))
+        }
+      case _ =>
+        throw new Exception("Invalid FHIR reference")
+    }
   }
 
   /**
@@ -906,4 +923,33 @@ object FHIRUtil {
   def mergeElementPath(mainPath:Option[String], subPath:String):String = mainPath.map(_ + ".").getOrElse("") + subPath
   def mergeElementPath(mainPath:String, subPath:String):String = if(mainPath == "") subPath else if(subPath == "") mainPath else mainPath + "."+ subPath
 
+  def mergeFilePath(mainPath:Option[String], subPath:String):String = mainPath.map(_ + "/").getOrElse("") + subPath
+
+
+  /**
+   * Decapitilize a string
+   * @param s
+   * @return
+   */
+  def decapitilize(s: String): String = {
+    s.charAt(0).toLower + s.substring(1)
+  }
+
+  /**
+   * FHIR index of query restrictions on the path
+   * @param pathParts     Splitted path
+   * @param restrictions  Restrictions on path e.g. @.type = email
+   **/
+  def findIndexOfRestrictionsOnPath(pathParts:Seq[String], restrictions:Seq[(String, String)]):Seq[(Int, Seq[(String, String)])]= {
+    val indexOfRestrictions  =
+      restrictions
+        .map(r => (pathParts.length - r._1.count(_ == '@') - 1) -> r)
+        .groupBy(_._1)
+        .map(g => g._1 ->
+          g._2.map(_._2)
+            .map(i => i._1.replace("@.", "") -> i._2) //remove paths
+        ).toSeq.sortBy(_._1)
+
+    indexOfRestrictions
+  }
 }

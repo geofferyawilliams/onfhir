@@ -2,7 +2,6 @@ package io.onfhir.server
 
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.server.{Directives, ExceptionHandler}
-import ca.uhn.fhir.validation.ResultSeverityEnum
 import com.fasterxml.jackson.core.JsonParseException
 import com.fasterxml.jackson.databind.JsonMappingException
 import io.onfhir.api.model.{FHIRRequest, FHIRResponse, OutcomeIssue}
@@ -10,8 +9,9 @@ import io.onfhir.exception._
 import io.onfhir.api.model.FHIRMarshallers._
 
 import scala.language.implicitConversions
-
+import org.slf4j.{Logger, LoggerFactory}
 object ErrorHandler {
+  val logger: Logger = LoggerFactory.getLogger(this.getClass.getName)
   /**
     * Exception Handler object
     * @return
@@ -36,7 +36,7 @@ object ErrorHandler {
           StatusCodes.BadRequest,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.INVALID,
               None,
               Some("Invalid JSON: " + ex.getMessage),
@@ -49,7 +49,7 @@ object ErrorHandler {
           StatusCodes.BadRequest,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.INVALID,
               None,
               Some("Invalid JSON: " + ex.getMessage),
@@ -62,7 +62,7 @@ object ErrorHandler {
           StatusCodes.BadRequest,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.INVALID,
               None,
               Some("Unaccepted numeric value: " + ex.getMessage),
@@ -77,7 +77,7 @@ object ErrorHandler {
           StatusCodes.BadRequest,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.INVALID,
               None,
               Some(ex.getMessage),
@@ -91,7 +91,7 @@ object ErrorHandler {
           StatusCodes.NotImplemented,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.NOT_SUPPORTED,
               None,
               Some(ex.getMessage),
@@ -104,7 +104,7 @@ object ErrorHandler {
         FHIRResponse.errorResponse(
           StatusCodes.Unauthorized,
           Seq(OutcomeIssue(
-            ResultSeverityEnum.ERROR.getCode,
+            FHIRResponse.SEVERITY_CODES.ERROR,
             FHIRResponse.OUTCOME_CODES.SECURITY,
             None,
             Some(s"Error: ${ex.authzResult.errorCode.get}; ${ex.authzResult.errorDesc.get}"),
@@ -124,21 +124,22 @@ object ErrorHandler {
           StatusCodes.InternalServerError,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.TRANSIENT,
               None,
               Some(ex.getMessage),
               Nil
             )
-          )
+          ) ++ ex.outcomeIssues
         )
       //Any exception
       case ex:Exception =>
+        logger.error("Unexpected exception!", ex)
         FHIRResponse.errorResponse(
           StatusCodes.InternalServerError,
           Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.TRANSIENT,
               None,
               Some(ex.getMessage),

@@ -1,9 +1,11 @@
 package io.onfhir.operation
 
+import java.time.Instant
+
 import akka.http.scaladsl.model.{DateTime, StatusCodes}
 import io.onfhir.api._
 import io.onfhir.api.model.{FHIROperationRequest, FHIROperationResponse}
-import io.onfhir.api.parsers.FHIRSearchParameterParser
+import io.onfhir.api.parsers.FHIRSearchParameterValueParser
 import io.onfhir.api.service.{FHIRCreateService, FHIROperationHandlerService, FHIRSearchService}
 import io.onfhir.api.util.FHIRUtil
 import io.onfhir.db.ResourceManager
@@ -36,7 +38,7 @@ class DocumentOperationHandler extends FHIROperationHandlerService {
     if(resourceId.isEmpty)
       throw new InternalServerException(s"Operation $operationName without [id] is not supported yet")
 
-    val searchParams = FHIRSearchParameterParser.parseSearchParameters(RESOURCE_COMPOSITION, Map(
+    val searchParams = FHIRSearchParameterValueParser.parseSearchParameters(RESOURCE_COMPOSITION, Map(
       SEARCHPARAM_ID -> List(resourceId.get),
       SEARCHPARAM_INCLUDE -> List("*")
     ))
@@ -65,7 +67,7 @@ class DocumentOperationHandler extends FHIROperationHandlerService {
         entry.remove("search")
       }*/
 
-      val persist = operationRequest.extractParam[String]("persist")
+      val persist = operationRequest.extractParamValue[String]("persist")
 
       val generatedBundle = persist match {
         case Some("true") =>
@@ -73,7 +75,7 @@ class DocumentOperationHandler extends FHIROperationHandlerService {
           bundle
         case _ => {
           val newVersion = 1L //new version is always 1 for create operation
-          val lastModified = DateTime.now
+          val lastModified = Instant.now()
           val newBundle = FHIRUtil.populateResourceWithMeta(result, (result \ "id").extractOpt[String], newVersion, lastModified)
           //newBundle.put(FHIR_EXTRA_FIELDS.STATUS_CODE, "")
           newBundle ~ (FHIR_EXTRA_FIELDS.STATUS_CODE, "")

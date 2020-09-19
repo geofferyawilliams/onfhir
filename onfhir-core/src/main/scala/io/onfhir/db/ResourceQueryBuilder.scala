@@ -1,9 +1,8 @@
 package io.onfhir.db
 
-import ca.uhn.fhir.validation.ResultSeverityEnum
 import io.onfhir.api._
 import io.onfhir.api.model.{FHIRResponse, OutcomeIssue, Parameter}
-import io.onfhir.api.parsers.FHIRSearchParameterParser
+import io.onfhir.api.parsers.FHIRSearchParameterValueParser
 import io.onfhir.api.util.FHIRUtil
 import io.onfhir.config.FhirConfigurationManager.fhirConfig
 import io.onfhir.config.{OnfhirConfig, SearchParameterConf}
@@ -27,9 +26,9 @@ object ResourceQueryBuilder {
     */
   def constructQueryForSimpleParameter(parameter:Parameter, searchParameterConf:SearchParameterConf):Bson = {
     //If parameter is on a extension, we should handle it differently
-    if(searchParameterConf.onExtension) {
+    /*if(searchParameterConf.onExtension) {
       constructQueryForExtensionParameter(parameter, searchParameterConf)
-    } else {
+    } else {*/
       //This part handles search with simple query parameters
       val queries =
         parameter
@@ -43,7 +42,7 @@ object ResourceQueryBuilder {
               case FHIR_PREFIXES_MODIFIERS.MISSING =>
                 if(searchParameterConf.ptype == FHIR_PARAMETER_TYPES.COMPOSITE)
                   throw new InvalidParameterException(s"Missing modifier cannot be used with composite parameters!")
-                val paths = searchParameterConf.extractElementPaths(withArrayIndicators = true).toSeq
+                val paths = searchParameterConf.extractElementPaths(withArrayIndicators = true)
                 PrefixModifierHandler.missingHandler(paths.map(FHIRUtil.normalizeElementPath), parameter.valuePrefixList.head._2)
 
               //Not modifier is common
@@ -57,7 +56,7 @@ object ResourceQueryBuilder {
           })
 
       if (queries.length > 1) or(queries: _*) else queries.head
-    }
+   // }
   }
 
   /**
@@ -70,34 +69,21 @@ object ResourceQueryBuilder {
     */
   private def constructQueryForSimple(value:String, paramType:String, modifierOrPrefix:String, searchParameterConf:SearchParameterConf) = {
     //For each possible path, construct queries
-    val queries = (searchParameterConf.extractElementPaths(withArrayIndicators = true), searchParameterConf.targetTypes, searchParameterConf.restrictions).zipped.toSeq map {
-      case (path, targetType, None) =>
-        SearchUtil
-          .typeHandlerFunction(paramType)(value, modifierOrPrefix, path, targetType, searchParameterConf.targets)
-      //If there is a restriction on the search we assume it is a direct field match e.g phone parameter on Patient
-      //e.g. f:PlanDefinition/f:relatedArtifact[f:type/@value='depends-on']/f:resource -->  path = relatedArtifact[i].resource, restriction = @.type -->  (relatedArtifact[i], resource, type)
-      //e.g. f:OrganizationAffiliation/f:telecom[system/@value='email']  --> path => telecom[i] , restriction = system --> (telecom[i], "", system)
-      case (path, targetType, Some(restriction)) =>
-        //If restriction is on parent, find the parent path
-        val (parentPath, childPath, restrictionPath) =
-          if(restriction._1.startsWith("@."))
-            ( path.split('.').dropRight(1).mkString("."), path.split('.').last,restriction._1.replace("@.", "") )
-          else
-            ( path, "", restriction._1 )
-
-        //Split the parent path
-        //e.g relatedArtifact[i] --> Some(relatedArtifact), None
-        val (elemMatchPath,  queryPath) = FHIRUtil.splitElementPathIntoElemMatchAndQueryPaths(parentPath)
-        val mainQuery = and(
-          SearchUtil
-            .typeHandlerFunction(paramType)(value, modifierOrPrefix, FHIRUtil.mergeElementPath(queryPath, childPath), targetType, searchParameterConf.targets),
-          Filters.eq(FHIRUtil.mergeElementPath(queryPath, restrictionPath), restriction._2)
-        )
-        elemMatchPath match {
-          case None => mainQuery
-          case Some(emp) => elemMatch(emp, mainQuery)
+    val queries =
+      searchParameterConf
+        .extractElementPathsTargetTypesAndRestrictions(withArrayIndicators = true)
+        .map {
+          case (path, targetType, Nil) =>
+            SearchUtil
+              .typeHandlerFunction(paramType)(value, modifierOrPrefix, path, targetType, searchParameterConf.targets)
+          //If there is a restriction on the search we assume it is a direct field match e.g phone parameter on Patient
+          //e.g. f:PlanDefinition/f:relatedArtifact[f:type/@value='depends-on']/f:resource -->  path = relatedArtifact[i].resource, restriction = @.type -->  (relatedArtifact[i], resource, type)
+          //e.g. f:OrganizationAffiliation/f:telecom[system/@value='email']  --> path => telecom[i] , restriction = system --> (telecom[i], "", system)
+          case (path, targetType, restrictions) =>
+            val pathParts = path.split('.')
+            val indexOfRestrictions  = FHIRUtil.findIndexOfRestrictionsOnPath(pathParts, restrictions)
+            SearchUtil.queryWithRestrictions(pathParts, indexOfRestrictions, value, paramType, targetType, modifierOrPrefix, searchParameterConf.targets)
         }
-    }
     //OR the queries for multiple paths
     if(queries.size > 1) or(queries:_*) else queries.head
   }
@@ -142,31 +128,31 @@ object ResourceQueryBuilder {
       throw new InvalidParameterException(s"Invalid query value supplied for composite parameter ${parameter.name}, it needs ${compositeParams.size} values to query seperated by dollar sign!")
 
     //Root paths for them to search on
-    val commonPaths = searchParamConf.extractElementPaths(withArrayIndicators = true)
-    val normalCommonPaths = commonPaths.filter(_ != "")
+    val commonPathsAndTargetTypes = searchParamConf.extractElementPathsAndTargetTypes(withArrayIndicators = true)
+    val normalCommonPaths = commonPathsAndTargetTypes.filter(_._1 != "").map(_._1)
 
     val queries = valuesArr.flatMap(value =>
       //For each common alternative path
-      commonPaths.zip(searchParamConf.targetTypes).map { case (commonPath, targetType) =>
+      commonPathsAndTargetTypes.map { case (commonPath, targetType) =>
         //Construct query for each composite
         val queriesForEachCombParam =
           compositeParams.zipWithIndex.map { case (compParamName, i) =>
             //Get the definition of combined search parameter
             val compParamConf = validQueryParameters(compParamName)
             //Parse value again as it may indicate a prefix (we don't parse prefixes in Composite at the beginning)
-            val (queryPartPrefix, queryPartValue) = FHIRSearchParameterParser.parseSimpleValue(value.apply(i), compParamConf.ptype).head
+            val (queryPartPrefix, queryPartValue) = FHIRSearchParameterValueParser.parseSimpleValue(value.apply(i), compParamConf.ptype).head
 
             //Find out the subpaths of this param after the common path
             val subpathsAfterCommonPathAndTargetTypes = commonPath match {
               //If the search is on root Resource, find the paths that does not belong to any common path listed
               case "" if targetType == "Resource" =>
                 compParamConf
-                  .extractElementPaths(withArrayIndicators = true).zip(compParamConf.targetTypes)
+                  .extractElementPathsAndTargetTypes(withArrayIndicators = true)
                   .filter(p => !normalCommonPaths.exists(p._1.startsWith))
               //Otherwise, find the paths that has this commonPath as prefix
               case _ =>
                 compParamConf
-                  .extractElementPaths(withArrayIndicators = true).zip(compParamConf.targetTypes)
+                  .extractElementPathsAndTargetTypes(withArrayIndicators = true)
                   .filter(p => p._1.startsWith(commonPath))
                   .map(p => p._1.replace(commonPath +".", "") -> p._2)
             }
@@ -244,19 +230,10 @@ object ResourceQueryBuilder {
     */
   def constructQueryForRevInclude(revIncludeReferences:Seq[String], parameterConf: SearchParameterConf):Bson = {
     val queries = parameterConf.paths.map {
-      //If the path is normal elements
       case normalPath: String =>
         val queries = revIncludeReferences.map(revIncludeRef =>
           SearchUtil.typeHandlerFunction(FHIR_PARAMETER_TYPES.REFERENCE)(revIncludeRef, "", normalPath, FHIR_DATA_TYPES.REFERENCE, Nil)
         )
-        if(queries.length > 1) or(queries:_*) else queries.head
-      //If the path is on extension elements
-      case extensionPath: Seq[(String, String)]@unchecked =>
-        val queries = revIncludeReferences.map(revIncludeRef =>
-           SearchUtil.extensionQuery(revIncludeRef, extensionPath, FHIR_PARAMETER_TYPES.REFERENCE, "", Nil)
-        )
-
-        //OR the queries for multiple values and multiple common paths
         if(queries.length > 1) or(queries:_*) else queries.head
     }
 
@@ -292,7 +269,7 @@ object ResourceQueryBuilder {
               FHIRUtil.extractValueOptionByPath[String](resource, elementPath) match {
                 case None => throw new BadRequestException(Seq(
                   OutcomeIssue(
-                    ResultSeverityEnum.FATAL.getCode,
+                    FHIRResponse.SEVERITY_CODES.FATAL,
                     FHIRResponse.OUTCOME_CODES.INVALID,
                     None,
                     Some(s"Collection for the resource type $rtype is sharded on path $elementPath! Therefore it is required, but the resource does not include the field! Please consult with the maintainer of the OnFhir repository."),

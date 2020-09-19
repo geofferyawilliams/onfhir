@@ -1,5 +1,7 @@
 package io.onfhir.db
 
+import java.time.Instant
+
 import akka.http.scaladsl.model.{DateTime, StatusCodes}
 import com.mongodb.client.model.IndexOptions
 import io.onfhir.api._
@@ -215,7 +217,7 @@ object DBInitializer {
               val updatesFutureChunk = chunk.map(r => {
                 //If versions are same, replace the document
                 if(r._2._1 == idsAndVersionsExist.apply(r._1)._1) {
-                  var ur = FHIRUtil.populateResourceWithMeta(r._2._2, Some(r._1), r._2._1, DateTime.now)
+                  var ur = FHIRUtil.populateResourceWithMeta(r._2._2, Some(r._1), r._2._1, Instant.now)
                   ur = FHIRUtil.populateResourceWithExtraFields(ur, FHIR_METHOD_NAMES.METHOD_PUT, StatusCodes.OK)
                   ResourceManager.replaceResource(resourceType, r._1, ur)
                 } else { //Otherwise update, so we can keep the versions
@@ -431,13 +433,13 @@ object DBInitializer {
     * @return IndexType, Path for the index, Index  object, IsSparse
     */
   private def createIndexesForComplexType(rtype:String, searchParameterConf: SearchParameterConf):Set[(String, String, Bson, Boolean)] = {
-    val paths = searchParameterConf.extractElementPaths()
+    val pathsAndTargetTypes = searchParameterConf.extractElementPathsAndTargetTypes()
     //if there are alternative paths, index should be sparse
     var isSparse = searchParameterConf.paths.size > 1
     // if it is on date, create
     val isDescending = searchParameterConf.ptype == FHIR_PARAMETER_TYPES.DATE
 
-    paths.zip(searchParameterConf.targetTypes).flatMap { case (path, ttype) =>
+    pathsAndTargetTypes.flatMap { case (path, ttype) =>
       val subPaths =
         INDEX_SUBPATHS
           .getOrElse(ttype, Seq("")) //Get the possible subpaths
@@ -465,7 +467,7 @@ object DBInitializer {
             isSparse
           )
       }
-    }
+    }.toSet
   }
 /*
   /**
@@ -514,6 +516,7 @@ object DBInitializer {
     * @return
     */
   def getConformance(resourceType:String):Resource = {
+    logger.info(s"Reading $resourceType of server from database ...")
     val job = ResourceManager.getResource(resourceType, SERVER_CONFORMANCE_STATEMENT_ID, None, excludeExtraFields = true) map {
       //No conformance statement
       case None =>
@@ -530,6 +533,7 @@ object DBInitializer {
     * @return
     */
   def getInrastructureResources(resourceType:String):Seq[Resource] = {
+    logger.info(s"Reading $resourceType definitions from database ...")
     val job =
       ResourceManager
         .queryResources(resourceType, List.empty, excludeExtraFields = true)

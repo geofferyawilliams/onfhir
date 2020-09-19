@@ -8,7 +8,7 @@ import org.json4s._
 
 import collection.JavaConverters._
 import scala.language.implicitConversions
-
+import io.onfhir.config.FhirConfigurationManager.fhirConfig
 
 /**
   * FHIR Path expression evaluator
@@ -35,7 +35,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
   override def visitInvocationTerm(ctx: FhirPathExprParser.InvocationTermContext):  Seq[FhirPathResult] = {
     ctx.invocation() match {
       case mi:MemberInvocationContext =>
-        val pathOrResourceType = mi.identifier().getText
+        val pathOrResourceType = FhirPathLiteralEvaluator.parseIdentifier(mi.identifier().getText)
         //If it is a resource type
         if(pathOrResourceType.head.isUpper){
           current
@@ -77,7 +77,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
     //Evaluate the left expression with the expected type
     val result = new FhirPathExpressionEvaluator(context, current, Some(fhirType)).visit(leftExpression)
     if(result.length > 1)
-      throw new Exception(s"Invalid type operator $op, the expression ${leftExpression.getText} does not evaluate to single item collection!")
+      throw new FhirPathException(s"Invalid type operator $op, the expression ${leftExpression.getText} does not evaluate to single item collection!")
 
     op match {
       case "as" => result
@@ -91,15 +91,23 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
     *     */
   override def visitMemberInvocation(ctx: FhirPathExprParser.MemberInvocationContext):Seq[FhirPathResult] = {
     //Element path
-    val pathName = ctx.identifier().getText + targetType.getOrElse("") //if there is target type add it e.g. Observation.value as Quantity --> search for valueQuantity
+    val pathName = FhirPathLiteralEvaluator.parseIdentifier(ctx.identifier().getText) + targetType.getOrElse("") //if there is target type add it e.g. Observation.value as Quantity --> search for valueQuantity
 
     //Execute the path and return
     current
       .filter(_.isInstanceOf[FhirPathComplex]) //Only get the complex objects
-      .flatMap(r =>
-        FhirPathValueTransformer
-          .transform(r.asInstanceOf[FhirPathComplex].json \ pathName  ) //Execute JSON path for each element
-      )
+      .flatMap(r => {
+        FhirPathValueTransformer.transform(r.asInstanceOf[FhirPathComplex].json \ pathName) match { //Execute JSON path for each element
+          //The field can be a multi valued so we should check if there is a field starting with the path
+          case Nil if targetType.isEmpty =>
+            r.asInstanceOf[FhirPathComplex].json.obj
+              .find(f => f._1.startsWith(pathName) && f._1.length > pathName.length && f._1.drop(pathName.length).head.isUpper)
+              .map(f => FhirPathValueTransformer.transform(f._2))
+              .getOrElse(Nil) //If not found still return nil
+          //Oth
+          case oth => oth
+        }
+      })
   }
 
   /**
@@ -110,7 +118,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
     //Evaluate array indice
     val indexValue = visit(ctx.expression(1))
     if(indexValue.length !=1 || !indexValue.head.isInstanceOf[FhirPathNumber] || !indexValue.head.asInstanceOf[FhirPathNumber].isInteger() )
-      throw new Exception(s"Evaluated array index is not a integer: $indexValue, at ${ctx.expression(0).getText}" )
+      throw new FhirPathException(s"Evaluated array index is not a integer: $indexValue, at ${ctx.expression(0).getText}" )
     val arrayIndex = indexValue.head.asInstanceOf[FhirPathNumber].v.toInt
     //Evaluate the left part
     val leftValue = visit(ctx.expression(0))
@@ -127,7 +135,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
   override def visitPolarityExpression(ctx: FhirPathExprParser.PolarityExpressionContext): Seq[FhirPathResult] = {
     val result = visit(ctx.expression())
     if(result.length != 1 && !(result.head.isInstanceOf[FhirPathNumber] | result.head.isInstanceOf[FhirPathNumber]))
-      throw new Exception(s"Unary operators '+' and '-' can be used only on number values, at ${ctx.expression().getText}!!!")
+      throw new FhirPathException(s"Unary operators '+' and '-' can be used only on number values, at ${ctx.expression().getText}!!!")
 
     ctx.getRuleContext().getChild(0).getText match {
       case "-" => Seq(result.head.asInstanceOf[FhirPathNumber].-())
@@ -144,7 +152,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
     val operand2 = visit(ctx.expression(1))
 
     if(operand1.length > 1 || operand2.length > 1)
-      throw new Exception(s"Additive operations like ${ctx.getRuleContext().getChild(1).getText} should be applied on single values on both sides !!!")
+      throw new FhirPathException(s"Additive operations like ${ctx.getRuleContext().getChild(1).getText} should be applied on single values on both sides !!!")
 
     val result:FhirPathResult = ctx.getRuleContext().getChild(1).getText match {
       case "+" =>
@@ -156,7 +164,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
             case (s1:FhirPathString, s2:FhirPathString) => s1 + s2
             case (dt:FhirPathDateTime, quantity: FhirPathQuantity) => dt + quantity
             case (t:FhirPathTime, quantity: FhirPathQuantity) => t + quantity
-            case (a1, a2) => throw new Exception(s"Invalid additive operation between $a1 and $a2 !!!")
+            case (a1, a2) => throw new FhirPathException(s"Invalid additive operation between $a1 and $a2 !!!")
           }
       case "-" =>
         if(operand1.isEmpty || operand2.isEmpty)
@@ -166,7 +174,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
             case (i1:FhirPathNumber, i2:FhirPathNumber) => i1 - i2
             case (dt:FhirPathDateTime, quantity: FhirPathQuantity) => dt - quantity
             case (t:FhirPathTime, quantity: FhirPathQuantity) => t - quantity
-            case (a1, a2) => throw new Exception(s"Invalid additive operation between $a1 and $a2 !!!")
+            case (a1, a2) => throw new FhirPathException(s"Invalid additive operation between $a1 and $a2 !!!")
           }
       case "&" => (operand1.headOption, operand2.headOption) match {
         case (Some(s1), Some(s2)) if s1.isInstanceOf[FhirPathString] && s2.isInstanceOf[FhirPathString]  =>
@@ -174,7 +182,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
 
         case (None, s2) => s2.getOrElse(FhirPathString(""))
         case (s1, None) => s1.getOrElse(FhirPathString(""))
-        case (a1, a2) => throw new Exception(s"Invalid additive operation between $a1 and $a2 !!!")
+        case (a1, a2) => throw new FhirPathException(s"Invalid additive operation between $a1 and $a2 !!!")
       }
     }
     if(result == null) Nil else Seq(result)
@@ -192,26 +200,26 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
       Nil
     else {
       if (operand1.length != 1 || operand2.length != 1)
-        throw new Exception(s"Multiplicative operations like ${ctx.getRuleContext().getChild(1).getText} should be applied on single values on both sides !!!")
+        throw new FhirPathException(s"Multiplicative operations like ${ctx.getRuleContext().getChild(1).getText} should be applied on single values on both sides !!!")
 
       val result: FhirPathResult = ctx.getRuleContext().getChild(1).getText match {
         case "*" =>
           (operand1.head, operand2.head) match {
             case (i1: FhirPathNumber, i2: FhirPathNumber) => i1 * i2
-            case (a1, a2) => throw new Exception(s"Invalid '*' operation between $a1 and $a2 !!!")
+            case (a1, a2) => throw new FhirPathException(s"Invalid '*' operation between $a1 and $a2 !!!")
           }
         case "/" =>
           (operand1.head, operand2.head) match {
             case (i1: FhirPathNumber, i2: FhirPathNumber) => i1 / i2
-            case (a1, a2) => throw new Exception(s"Invalid '/' operation between $a1 and $a2 !!!")
+            case (a1, a2) => throw new FhirPathException(s"Invalid '/' operation between $a1 and $a2 !!!")
           }
         case "mod" => (operand1.head, operand2.head) match {
           case (i1: FhirPathNumber, i2: FhirPathNumber) => i1 mod i2
-          case (a1, a2) => throw new Exception(s"Invalid 'mod' operation between $a1 and $a2 !!!")
+          case (a1, a2) => throw new FhirPathException(s"Invalid 'mod' operation between $a1 and $a2 !!!")
         }
         case "div" => (operand1.head, operand2.head) match {
           case (i1: FhirPathNumber, i2: FhirPathNumber) => i1 div i2
-          case (a1, a2) => throw new Exception(s"Invalid 'div' operation between $a1 and $a2 !!!")
+          case (a1, a2) => throw new FhirPathException(s"Invalid 'div' operation between $a1 and $a2 !!!")
         }
       }
       Seq(result)
@@ -235,27 +243,37 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
     *     */
   override def visitOrExpression(ctx: FhirPathExprParser.OrExpressionContext): Seq[FhirPathResult] = {
     val operand1 = visit(ctx.expression(0))
-    val operand2 = visit(ctx.expression(1))
-    if (operand1.length > 1 || operand2.length > 1)
-      throw new Exception(s"Logical operations like 'or' should be applied on single values on both sides !!!")
+
+    if (operand1.length > 1)
+      throw new FhirPathException(s"Logical operations like 'or' should be applied on single values on both sides !!!")
 
     ctx.getRuleContext().getChild(1).getText match {
       case "or" =>
-        (operand1.headOption, operand2.headOption) match {
-            case (Some(b1: FhirPathBoolean), Some(b2: FhirPathBoolean) ) => Seq (b1 or b2)
-            case (None, Some (FhirPathBoolean (true) ) ) => Seq (FhirPathBoolean (true) )
-            case (Some (FhirPathBoolean (true) ), None) => Seq (FhirPathBoolean (true) )
-            case (Some (FhirPathBoolean (false) ), None) => Nil
-            case (None, Some (FhirPathBoolean (false) ) ) => Nil
-            case (None, None) => Nil
-            case (a1, a2) => throw new Exception(s"Invalid 'or' operation between $a1 and $a2 !!!")
+        operand1.headOption match {
+          //true no need to look second operand
+          case Some(FhirPathBoolean (true)) => Seq(FhirPathBoolean (true))
+          case oth =>
+            val operand2 = visit(ctx.expression(1))
+            if (operand2.length > 1)
+              throw new FhirPathException(s"Logical operations like 'or' should be applied on single values on both sides !!!")
+            (oth, operand2.headOption) match {
+              case (None, Some (FhirPathBoolean (true) ) ) => Seq (FhirPathBoolean (true))
+              case (None,  Some(FhirPathBoolean (false))) => Nil
+              case (None, None) => Nil
+              case (Some (FhirPathBoolean (false)), Some (FhirPathBoolean (true) ) ) => Seq (FhirPathBoolean (true))
+              case (Some (FhirPathBoolean (false)), Some(FhirPathBoolean (false))) => Seq(FhirPathBoolean (false))
+              case (Some (FhirPathBoolean (false)), None) => Nil
+              case (a1, a2) => throw new FhirPathException(s"Invalid 'or' operation between non boolean operands $a1 and $a2 !!!")
+            }
         }
+
       case "xor" =>
+        val operand2 = visit(ctx.expression(1))
         (operand1.headOption, operand2.headOption) match {
           case (None, _) => Nil
           case (_, None) => Nil
           case (Some(b1: FhirPathBoolean), Some(b2: FhirPathBoolean) ) => Seq(b1 xor b2)
-          case (a1, a2) => throw new Exception(s"Invalid 'xor' operation between $a1 and $a2 !!!")
+          case (a1, a2) => throw new FhirPathException(s"Invalid 'xor' operation between $a1 and $a2 !!!")
         }
     }
   }
@@ -266,18 +284,26 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
     *     */
   override def visitAndExpression(ctx: FhirPathExprParser.AndExpressionContext): Seq[FhirPathResult] = {
     val operand1 = visit(ctx.expression(0))
-    val operand2 = visit(ctx.expression(1))
-    if (operand1.length > 1 || operand2.length > 1)
-      throw new Exception(s"Logical operations like 'and' should be applied on single values on both sides !!!")
 
-    (operand1.headOption, operand2.headOption) match {
-          case (Some(b1: FhirPathBoolean), Some(b2: FhirPathBoolean) ) => Seq (b1 and b2)
+    if (operand1.length > 1)
+      throw new FhirPathException(s"Logical operations like 'and' should be applied on single values on both sides, operand 1 returns multiple values!!!")
+
+    operand1.headOption match {
+      case Some(FhirPathBoolean(false)) => Seq(FhirPathBoolean (false))
+      case oth =>
+        val operand2 = visit(ctx.expression(1))
+        if (operand2.length > 1)
+          throw new FhirPathException(s"Logical operations like 'and' should be applied on single values on both sides, operand 2 returns multiple values!!!")
+
+        (oth, operand2.headOption) match {
           case (None, Some (FhirPathBoolean (true) ) ) => Nil
-          case (Some (FhirPathBoolean (true) ), None) => Nil
-          case (Some (FhirPathBoolean (false) ), None) => Seq(FhirPathBoolean (false))
           case (None, Some (FhirPathBoolean (false) ) ) => Seq(FhirPathBoolean (false))
           case (None, None) => Nil
-          case (a1, a2) => throw new Exception(s"Invalid 'and' operation between $a1 and $a2 !!!")
+          case (Some(FhirPathBoolean(true)), None) => Nil
+          case (Some(FhirPathBoolean(true)), Some (FhirPathBoolean (true) )) =>  Seq(FhirPathBoolean (true))
+          case (Some(FhirPathBoolean(true)), Some (FhirPathBoolean (false) )) =>  Seq(FhirPathBoolean (false))
+          case (a1, a2) => throw new Exception(s"Invalid 'and' operation between non boolean operands $a1 and $a2 !!!")
+        }
     }
   }
 
@@ -288,20 +314,20 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
   override def visitImpliesExpression(ctx: FhirPathExprParser.ImpliesExpressionContext): Seq[FhirPathResult] = {
     val operand1 = visit(ctx.expression(0))
     if (operand1.length > 1)
-      throw new Exception(s"Logical operations like 'implies' should be applied on single values on left side !!!")
+      throw new FhirPathException(s"Logical operations like 'implies' should be applied on single values on left side !!!")
 
     operand1.headOption match {
       case Some(FhirPathBoolean(true))  =>
         val operand2 = visit(ctx.expression(1))
         if (operand2.length > 1)
-          throw new Exception(s"Logical operations like 'implies' should be applied on single values on right side !!!")
+          throw new FhirPathException(s"Logical operations like 'implies' should be applied on single values on right side !!!")
         else operand2
       //If left is false, then it is true
       case Some(FhirPathBoolean(false)) => Seq(FhirPathBoolean(true))
-      case None =>
+      case _ =>
         val operand2 = visit(ctx.expression(1))
         if (operand2.length > 1)
-          throw new Exception(s"Logical operations like 'implies' should be applied on single values on right side !!!")
+          throw new FhirPathException(s"Logical operations like 'implies' should be applied on single values on right side !!!")
         operand2 match{
           case Seq(FhirPathBoolean(true)) => operand2
           case _ => Nil
@@ -322,7 +348,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
         operand1 match {
           case Nil => Nil
           case Seq(a) => Seq(FhirPathBoolean(operand2.contains(a)))
-          case _ =>   throw new Exception(s"Left operand ${ctx.expression(0).getText} should return single value for 'in' operation !!!")
+          case _ =>   throw new FhirPathException(s"Left operand ${ctx.expression(0).getText} should return single value for 'in' operation !!!")
         }
       case "contains" =>
         operand2 match {
@@ -333,7 +359,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
             Seq(FhirPathBoolean(ss == "" || leftStr.contains(ss)))
           case Seq(a) =>
             Seq(FhirPathBoolean(operand1.contains(a)))
-          case _ =>   throw new Exception(s"Right operand ${ctx.expression(1).getText} should return single value for 'contains' operation !!!")
+          case _ =>   throw new FhirPathException(s"Right operand ${ctx.expression(1).getText} should return single value for 'contains' operation !!!")
         }
     }
   }
@@ -349,7 +375,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
       Nil
     else {
       if (operand1.length != 1 || operand2.length != 1)
-        throw new Exception(s"Inequality operations like ${ctx.getRuleContext().getChild(1).getText} should be applied on single values on both sides !!!")
+        throw new FhirPathException(s"Inequality operations like ${ctx.getRuleContext().getChild(1).getText} should be applied on single values on both sides !!!")
 
       val op = ctx.getRuleContext().getChild(1).getText
 
@@ -358,7 +384,15 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
         case (dt1:FhirPathDateTime, dt2:FhirPathDateTime) => dt1.compare(dt2)
         case (t1:FhirPathTime, t2:FhirPathTime) => t1.compare(t2)
         case (s1:FhirPathString, s2:FhirPathString) => s1.compare(s2)
-        case (a1, a2) => throw new Exception(s"Invalid $op operation between $a1 and $a2 !!!")
+        case (q1:FhirPathQuantity, q2:FhirPathQuantity) => q1.compare(q2)
+        case (o1:FhirPathComplex, o2:FhirPathComplex) =>
+          val q1 = o1.toQuantity()
+          val q2 = o2.toQuantity()
+          if(q1.isDefined && q2.isDefined)
+            q1.get.compare(q2.get)
+          else
+            throw new FhirPathException(s"Invalid $op operation between ${o1.toJson} and ${o2.toJson} !!!")
+        case (a1, a2) => throw new FhirPathException(s"Invalid $op operation between $a1 and $a2 !!!")
       }
       op match {
         case ">=" => Seq(FhirPathBoolean(comparison >= 0))
@@ -384,7 +418,7 @@ class FhirPathExpressionEvaluator(context:FhirPathEnvironment, current:Seq[FhirP
             if(typeFunctions.contains(fname)){
               val params = Option(fn.function().paramList()).map(_.expression().asScala).getOrElse(Nil)
               if(params.length != 1)
-                throw new Exception(s"Invalid function call $fname, it expects a single parameter which is the FHIR type identifier...")
+                throw new FhirPathException(s"Invalid function call $fname, it expects a single parameter which is the FHIR type identifier...")
               val fhirType = params.head.getText
               //Evaluate the parent with the target type
               new FhirPathExpressionEvaluator(context, current, Some(fhirType)).visit(ctx.expression())

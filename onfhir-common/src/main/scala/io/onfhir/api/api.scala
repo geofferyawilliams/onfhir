@@ -1,5 +1,6 @@
 package io.onfhir
 
+import io.onfhir.api.util.FHIRUtil
 import io.onfhir.config.OnfhirConfig
 import org.json4s.JsonAST.JObject
 
@@ -25,7 +26,7 @@ package object api {
   /**
     * Default Root Folder for FHIR infrastructure resource configurations
     */
-  var DEFAULT_ROOT_FOLDER = ""
+  var DEFAULT_ROOT_FOLDER:Option[String] = None
 
   /**
     * Names of main FHIR versions to be used within configurations
@@ -44,7 +45,7 @@ package object api {
   val FHIR_URL_FOR_EXTERNAL_FHIR_CODE_SYSTEMS = "http://terminology.hl7.org"
 
   /**
-    * Default id of the Conformance [DSTU2] or CapabilityStatement [STU3] resource held in the db, and returned for "metadata" queries
+    * Default id of the Conformance [DSTU2] or CapabilityStatement [STU3 or above] resource held in the db, and returned for "metadata" queries
     */
   val SERVER_CONFORMANCE_STATEMENT_ID = "server-conf-statement"
 
@@ -52,21 +53,21 @@ package object api {
     * Default paths for the infrastructure resources to configure the platform
     */
   object DEFAULT_RESOURCE_PATHS {
-    def BASE_DEFINITONS:String = DEFAULT_ROOT_FOLDER + "/definitions.xml.zip"
-    def PROFILES_FOLDER:String = DEFAULT_ROOT_FOLDER + "/profiles.zip"
-    def CONFORMANCE_PATH:String = DEFAULT_ROOT_FOLDER + "/conformance-statement"+CONFORMANCE_FILE_SUFFIX
-    def SEARCH_PARAMETER:String = DEFAULT_ROOT_FOLDER + "/search-parameters.zip"
-    def COMPARTMENTS_PATH:String = DEFAULT_ROOT_FOLDER + "/compartments.zip"
-    def VALUESETS_PATH:String = DEFAULT_ROOT_FOLDER + "/value-sets.zip"
-    def CODESYSTEMS_PATH:String = DEFAULT_ROOT_FOLDER + "/code-systems.zip"
-    def OPDEFS_PATH:String = DEFAULT_ROOT_FOLDER + "/operation-definitions.zip"
-    def INDEX_CONF_PATH:String = DEFAULT_ROOT_FOLDER + "/db-index-conf.json"
+    def BASE_DEFINITONS:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER, s"definitions${FOUNDATION_RESOURCES_FILE_SUFFIX}.zip")
+    def PROFILES_FOLDER:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER, "profiles.zip")
+    def CONFORMANCE_PATH:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER, s"conformance-statement$FOUNDATION_RESOURCES_FILE_SUFFIX")
+    def SEARCH_PARAMETER:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER,  "search-parameters.zip")
+    def COMPARTMENTS_PATH:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER , "compartments.zip")
+    def VALUESETS_PATH:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER, "value-sets.zip")
+    def CODESYSTEMS_PATH:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER, "code-systems.zip")
+    def OPDEFS_PATH:String =  FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER,"operation-definitions.zip")
+    def INDEX_CONF_PATH:String = FHIRUtil.mergeFilePath(DEFAULT_ROOT_FOLDER,"db-index-conf.json")
   }
 
   /**
     * Indicates the file extension for Conformance statement
     */
-  var CONFORMANCE_FILE_SUFFIX = ".xml"
+  var FOUNDATION_RESOURCES_FILE_SUFFIX = ".json"
 
   /**
     * Different types of FHIR Bundle See https://www.hl7.org/fhir/valueset-bundle-type.html
@@ -152,6 +153,7 @@ package object api {
     val MONGO_ID = "_id"
     val ID = "id"
     val VERSION_ID = "versionId"
+    val VERSION = "version"
     val LANGUAGE= "language"
 
     // Inner Search Fields
@@ -177,6 +179,7 @@ package object api {
     val UPPER_LIMIT = "upperLimit"
     val EVENT = "event"
     val IDENTIFIER = "identifier"
+    val CURRENCY = "currency"
   }
 
   /**
@@ -278,8 +281,10 @@ package object api {
     val MARKDOWN = "markdown"
     val UNSIGNEDINT = "unsignedInt"
     val POSITIVEINT = "positiveInt"
+    val XHTML = "xhtml"
     //Complex types
     //Special purpose Types
+    val ELEMENT = "Element"
     val RESOURCE = "Resource"
     val PARAMETERS = "Parameters"
     val META = "Meta"
@@ -314,91 +319,15 @@ package object api {
     val IDENTIFIER = "Identifier"
     val ANNOTATION = "Annotation"
     val QUANTITY = "Quantity"
-    val AGE = "age"
-    val COUNT = "count"
-    val DISTANCE = "distance"
-    val DURATION = "duration"
-    val MONEY = "money"
+    val AGE = "Age"
+    val COUNT = "Count"
+    val DISTANCE = "Distance"
+    val DURATION = "Duration"
+    val MONEY = "Money"
     val SIMPLE_QUANTITY = "SimpleQuantity"
     val MONEY_QUANTITY = "MoneyQuantity"
   }
 
-  /**
-    * List of FHIR Primitive Data Types. See https://www.hl7.org/fhir/datatypes.html
-    */
-  val FHIR_PRIMITIVE_TYPES =
-    Set(
-      FHIR_DATA_TYPES.BOOLEAN,
-      FHIR_DATA_TYPES.INTEGER,
-      FHIR_DATA_TYPES.STRING,
-      FHIR_DATA_TYPES.DECIMAL,
-      FHIR_DATA_TYPES.URI,
-      FHIR_DATA_TYPES.URL,
-      FHIR_DATA_TYPES.CANONICAL,
-      FHIR_DATA_TYPES.OID,
-      FHIR_DATA_TYPES.UUID,
-      FHIR_DATA_TYPES.BASE64BINARY,
-      FHIR_DATA_TYPES.INSTANT,
-      FHIR_DATA_TYPES.DATE,
-      FHIR_DATA_TYPES.DATETIME,
-      FHIR_DATA_TYPES.TIME,
-      FHIR_DATA_TYPES.CODE,
-      FHIR_DATA_TYPES.ID,
-      FHIR_DATA_TYPES.MARKDOWN,
-      FHIR_DATA_TYPES.UNSIGNEDINT,
-      FHIR_DATA_TYPES.POSITIVEINT
-      )
-
-  /**
-    * List of FHIR Complex Data Types. See https://www.hl7.org/fhir/datatypes.html
-    */
-  val FHIR_COMPLEX_TYPES:Set[String] = Set(
-    //Special purpose
-    FHIR_DATA_TYPES.META,
-    FHIR_DATA_TYPES.REFERENCE,
-    FHIR_DATA_TYPES.EXTENSION,
-    FHIR_DATA_TYPES.NARRATIVE,
-    FHIR_DATA_TYPES.BACKBONE,
-    FHIR_DATA_TYPES.DOSAGE,
-    FHIR_DATA_TYPES.ELEMENT_DEFINITION,
-    //metadata types
-    FHIR_DATA_TYPES.CONTACT_DETAIL,
-    FHIR_DATA_TYPES.USAGE_CONTEXT,
-    FHIR_DATA_TYPES.DATA_REQUIREMENT,
-    FHIR_DATA_TYPES.CONTRIBUTOR,
-    FHIR_DATA_TYPES.RELATED_ARTIFACT,
-    FHIR_DATA_TYPES.PARAMETER_DEFINITION,
-    FHIR_DATA_TYPES.TRIGGER_DEFINITION,
-    FHIR_DATA_TYPES.EXPRESSION,
-    //Other general
-    FHIR_DATA_TYPES.RANGE,
-    FHIR_DATA_TYPES.PERIOD,
-    FHIR_DATA_TYPES.TIMING,
-    FHIR_DATA_TYPES.RATIO,
-    FHIR_DATA_TYPES.QUANTITY,
-    FHIR_DATA_TYPES.SAMPLED_DATA,
-    FHIR_DATA_TYPES.ATTACHMENT,
-    FHIR_DATA_TYPES.CODING,
-    FHIR_DATA_TYPES.CODEABLE_CONCEPT,
-    FHIR_DATA_TYPES.HUMAN_NAME,
-    FHIR_DATA_TYPES.ADDRESS,
-    FHIR_DATA_TYPES.CONTACT_POINT,
-    FHIR_DATA_TYPES.SIGNATURE,
-    FHIR_DATA_TYPES.IDENTIFIER,
-    FHIR_DATA_TYPES.ANNOTATION,
-    FHIR_DATA_TYPES.AGE,
-    FHIR_DATA_TYPES.DISTANCE,
-    FHIR_DATA_TYPES.DURATION,
-    FHIR_DATA_TYPES.COUNT,
-    FHIR_DATA_TYPES.MONEY,
-    FHIR_DATA_TYPES.SIMPLE_QUANTITY,
-    FHIR_DATA_TYPES.MONEY_QUANTITY
-  )
-
-  /**
-    * List of All FHIR Data Types. See https://www.hl7.org/fhir/datatypes.html
-    */
-  val FHIR_ALL_DATA_TYPES:Set[String] = FHIR_PRIMITIVE_TYPES ++ FHIR_COMPLEX_TYPES
   /**
     * Fhir search result parameter names. See Search Control Parameters in https://www.hl7.org/fhir/search.html
     */
@@ -457,7 +386,9 @@ package object api {
     val IN = ":in"
     val NOT_IN = ":not-in"
     val OF_TYPE = ":of-type"
-    val STARTS_WITH = ":sw" // onFHIR specific extension for handling starts-with queries in coded fields
+    // onFHIR specific extension for handling starts-with queries in coded fields
+    val STARTS_WITH = ":sw"
+    val NOT_STARTS_WITH=":nsw"
 
     // Prefixes
     val DESCENDING="-"
@@ -540,12 +471,12 @@ package object api {
     */
   val FHIR_PARAMETER_TYPE_TARGETS = scala.collection.immutable.Map(
     FHIR_PARAMETER_TYPES.DATE -> Set(FHIR_DATA_TYPES.DATE, FHIR_DATA_TYPES.DATETIME, FHIR_DATA_TYPES.INSTANT, FHIR_DATA_TYPES.PERIOD, FHIR_DATA_TYPES.TIMING),
-    FHIR_PARAMETER_TYPES.URI -> Set(FHIR_DATA_TYPES.URI, FHIR_DATA_TYPES.STRING, FHIR_DATA_TYPES.CANONICAL, FHIR_DATA_TYPES.UUID, FHIR_DATA_TYPES.OID),
-    FHIR_PARAMETER_TYPES.STRING -> Set(FHIR_DATA_TYPES.STRING, FHIR_DATA_TYPES.HUMAN_NAME, FHIR_DATA_TYPES.ADDRESS),
+    FHIR_PARAMETER_TYPES.URI -> Set(FHIR_DATA_TYPES.URI, FHIR_DATA_TYPES.URL, FHIR_DATA_TYPES.STRING, FHIR_DATA_TYPES.CANONICAL, FHIR_DATA_TYPES.UUID, FHIR_DATA_TYPES.OID),
+    FHIR_PARAMETER_TYPES.STRING -> Set(FHIR_DATA_TYPES.STRING, FHIR_DATA_TYPES.HUMAN_NAME, FHIR_DATA_TYPES.ADDRESS, FHIR_DATA_TYPES.MARKDOWN),
     FHIR_PARAMETER_TYPES.TOKEN -> Set(FHIR_DATA_TYPES.CODEABLE_CONCEPT, FHIR_DATA_TYPES.CODING, FHIR_DATA_TYPES.CODE, FHIR_DATA_TYPES.IDENTIFIER, FHIR_DATA_TYPES.CONTACT_POINT, FHIR_DATA_TYPES.QUANTITY, FHIR_DATA_TYPES.ID, FHIR_DATA_TYPES.BOOLEAN, FHIR_DATA_TYPES.STRING, FHIR_DATA_TYPES.STRING),
-    FHIR_PARAMETER_TYPES.REFERENCE -> Set(FHIR_DATA_TYPES.REFERENCE, FHIR_DATA_TYPES.CANONICAL),
+    FHIR_PARAMETER_TYPES.REFERENCE -> Set(FHIR_DATA_TYPES.REFERENCE, FHIR_DATA_TYPES.CANONICAL, FHIR_DATA_TYPES.RESOURCE),
     FHIR_PARAMETER_TYPES.NUMBER -> Set(FHIR_DATA_TYPES.INTEGER, FHIR_DATA_TYPES.DECIMAL, FHIR_DATA_TYPES.RANGE, FHIR_DATA_TYPES.POSITIVEINT, FHIR_DATA_TYPES.UNSIGNEDINT),
-    FHIR_PARAMETER_TYPES.QUANTITY -> Set(FHIR_DATA_TYPES.QUANTITY, FHIR_DATA_TYPES.SIMPLE_QUANTITY, FHIR_DATA_TYPES.MONEY_QUANTITY, FHIR_DATA_TYPES.COUNT, FHIR_DATA_TYPES.DURATION, FHIR_DATA_TYPES.DISTANCE, FHIR_DATA_TYPES.AGE)
+    FHIR_PARAMETER_TYPES.QUANTITY -> Set(FHIR_DATA_TYPES.QUANTITY, FHIR_DATA_TYPES.SIMPLE_QUANTITY, FHIR_DATA_TYPES.MONEY, FHIR_DATA_TYPES.MONEY_QUANTITY, FHIR_DATA_TYPES.COUNT, FHIR_DATA_TYPES.DURATION, FHIR_DATA_TYPES.DISTANCE, FHIR_DATA_TYPES.AGE, FHIR_DATA_TYPES.RANGE, FHIR_DATA_TYPES.SAMPLED_DATA)
   )
 
   /**
@@ -684,16 +615,37 @@ package object api {
   }
 
   /**
-    * FHIR Operations that are defined by FHIR and implemented in default
+   * FHIR Subscription channel type
+   */
+  object SubscriptionChannelTypes {
+    val WebSocket = "websocket"
+    val RestHook = "rest-hook"
+    val Email = "email"
+    val Sms = "sms"
+    val Message = "message"
+  }
+
+  val SUPPORTED_SUBSCRIPTION_CHANNELS = Set(SubscriptionChannelTypes.WebSocket, SubscriptionChannelTypes.RestHook)
+
+  object SubscriptionStatusCodes {
+    val error = "error"
+    val active = "active"
+    val requested = "requested"
+    val off = "off"
+  }
+
+  /**
+    * FHIR Operations that are defined by FHIR and implemented in default within onFhir
     */
   val DEFAULT_IMPLEMENTED_FHIR_OPERATIONS:Map[String, String] =
     Map(
-      "meta" -> "io.onfhir.operation.MetaOperationHandler",
-      "meta-add" -> "io.onfhir.operation.MetaOperationHandler",
-      "meta-delete" -> "io.onfhir.operation.MetaOperationHandler",
-      "validate" -> "io.onfhir.operation.ValidationOperationHandler",
-      "expand" -> "io.onfhir.operation.ExpandOperationHandler",
-      "document" -> "io.onfhir.operation.DocumentOperationHandler"
+      "http://hl7.org/fhir/OperationDefinition/Resource-meta" -> "io.onfhir.operation.MetaOperationHandler",
+      "http://hl7.org/fhir/OperationDefinition/Resource-meta-add" -> "io.onfhir.operation.MetaOperationHandler",
+      "http://hl7.org/fhir/OperationDefinition/Resource-meta-delete" -> "io.onfhir.operation.MetaOperationHandler",
+      "http://hl7.org/fhir/OperationDefinition/Resource-validate" -> "io.onfhir.operation.ValidationOperationHandler",
+      "http://hl7.org/fhir/OperationDefinition/ValueSet-expand" -> "io.onfhir.operation.ExpandOperationHandler",
+      "http://hl7.org/fhir/OperationDefinition/Composition-document" -> "io.onfhir.operation.DocumentOperationHandler",
+      "http://hl7.org/fhir/OperationDefinition/Observation-lastn" -> "io.onfhir.operation.LastNObservationOperationHandler"
     )
 
 

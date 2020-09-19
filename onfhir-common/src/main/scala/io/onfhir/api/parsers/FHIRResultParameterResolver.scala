@@ -25,7 +25,7 @@ object FHIRResultParameterResolver {
               (
                 spConf.pname, //Name of the parameter
                 if(pv._1 == FHIR_PREFIXES_MODIFIERS.DESCENDING) -1 else 1,  //Either ascending or descending
-                spConf.extractElementPaths().zip(spConf.targetTypes).toSeq //Zip the path and target types
+                spConf.extractElementPathsAndTargetTypes() //Zip the path and target types
               )
             case _ => throw new UnsupportedParameterException(s"Search parameter ${p.name} is not supported for resource type $rtype, or you can not use it for sorting! Check conformance statement of server!")
           }
@@ -100,7 +100,7 @@ object FHIRResultParameterResolver {
     */
   def resolveSummary(rtype:String, summary:String):Option[(Boolean, Set[String])] = {
     //Summary fields for resource type
-    val summaryFields = fhirConfig.summaryParameters.getOrElse(rtype, Set.empty[String])
+    val summaryFields = fhirConfig.getSummaryElements(rtype)
 
     summary match {
       case "false" =>

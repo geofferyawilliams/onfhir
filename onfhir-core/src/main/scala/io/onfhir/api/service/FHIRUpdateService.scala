@@ -1,7 +1,6 @@
 package io.onfhir.api.service
 
 import akka.http.scaladsl.model.{StatusCodes, Uri}
-import ca.uhn.fhir.validation.ResultSeverityEnum
 import io.onfhir.api._
 import io.onfhir.api.model.{FHIRRequest, FHIRResponse, OutcomeIssue, Parameter}
 import io.onfhir.api.util.FHIRUtil
@@ -21,14 +20,16 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
     * @param fhirRequest FHIR Request
     */
   override def validateInteraction(fhirRequest: FHIRRequest): Future[Unit] = {
-      if(fhirRequest.resourceId.isDefined)
+     val validations =
+       if(fhirRequest.resourceId.isDefined)
         validateUpdateInteraction(fhirRequest.resource.get, fhirRequest.resourceType.get, fhirRequest.resourceId.get, fhirRequest.ifMatch)
-      else {
-        validateConditionalUpdateInteraction(fhirRequest.resource.get, fhirRequest.resourceType.get, fhirRequest.queryParams, fhirRequest.prefer)/*.map( validQueryParams =>
-          //Set valid Query params to request
-          fhirRequest.queryParams = validQueryParams
-        )*/
-      }
+       else
+         validateConditionalUpdateInteraction(fhirRequest.resource.get, fhirRequest.resourceType.get, fhirRequest.queryParams, fhirRequest.prefer)
+
+    validations.map(_ =>
+      //Extra business rules validations if exist
+      FHIRApiValidator.validateExtraRules(fhirRequest)
+    )
   }
 
   /**
@@ -61,7 +62,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
     //1.4) Check if only versioned update is supported, then ifMatch should exist
     FHIRApiValidator.validateVersionedUpdate(_type, ifmatch)
     //1.5) Validate the conformance of resource
-    fhirValidator.validateResource(resource).map(_ => Unit)
+    fhirValidator.validateResource(resource, _type).map(_ => Unit)
   }
 
 
@@ -80,7 +81,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
     //1.3) Check the resource type consistency
     FHIRApiValidator.validateResourceType(resource, _type)
     //1.4) Validate the conformance of resource
-    fhirValidator.validateResource(resource).map(_ => Unit)
+    fhirValidator.validateResource(resource, _type).map(_ => Unit)
   }
 
   /**
@@ -126,7 +127,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
                   logger.debug("Supplied resource id matches another FHIR resource which does not satisfy the given query!")
                   throw new BadRequestException(Seq(
                     OutcomeIssue(
-                      ResultSeverityEnum.ERROR.getCode,
+                      FHIRResponse.SEVERITY_CODES.ERROR,
                       FHIRResponse.OUTCOME_CODES.INVALID,
                       None,
                       Some(s"Supplied resource id matches another FHIR resource which does not satisfy the given query!"),
@@ -148,7 +149,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
           logger.debug("There is one match in conditional update query, but resource id provided but does not match the resource found")
           throw new BadRequestException(Seq(
             OutcomeIssue(
-              ResultSeverityEnum.ERROR.getCode,
+              FHIRResponse.SEVERITY_CODES.ERROR,
               FHIRResponse.OUTCOME_CODES.INVALID,
               None,
               Some(s"There is one match in conditional update query, but resource id provided but does not match the resource found!"),
@@ -161,7 +162,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
         logger.debug("Multiple matches exist with given parameters, return 412 - Precondition Failed")
         throw new PreconditionFailedException(Seq(
           OutcomeIssue(
-            ResultSeverityEnum.ERROR.getCode,
+            FHIRResponse.SEVERITY_CODES.ERROR,
             FHIRResponse.OUTCOME_CODES.INVALID,
             None,
             Some(s"Multiple matches exist with given parameters, for the conditional update"),
@@ -212,6 +213,8 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
     * @return
     */
   def performUpdate(resourceIn:Resource, rtype:String, rid:Option[String], prefer:Option[String], testUpdate:Boolean = false, oldVersion:Option[(Long, Resource)] = None, wasDeleted:Boolean = false):Future[FHIRResponse] = {
+    oldVersion.foreach(ov => FHIRApiValidator.validateContentChanges(rtype, ov._2, resourceIn))
+
     if (!testUpdate) {
       oldVersion match {
         case None =>
@@ -221,7 +224,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
             case (newId, newVersion, lastModified, createdResource) =>
               FHIRResponse(
                 StatusCodes.Created ,
-                Some(FHIRUtil.getResourceContentByPreference(createdResource, prefer)), //HTTP Body
+                FHIRUtil.getResourceContentByPreference(createdResource, prefer), //HTTP Body
                 Some(Uri(FHIRUtil.resourceLocationWithVersion(rtype, newId, newVersion))), //HTTP Location header
                 Some(lastModified), //HTTP Last-Modified header
                 Some(newVersion) //HTTP ETag header
@@ -237,7 +240,7 @@ class FHIRUpdateService(transactionSession: Option[TransactionSession] = None) e
             case (newVersion, lastModified, updatedResource) =>
               FHIRResponse(
                 if(ov._1 > 0 && !wasDeleted) StatusCodes.OK else StatusCodes.Created,
-                Some(FHIRUtil.getResourceContentByPreference(updatedResource, prefer)), //HTTP Body
+                FHIRUtil.getResourceContentByPreference(updatedResource, prefer), //HTTP Body
                 Some(Uri(FHIRUtil.resourceLocationWithVersion(rtype, rid.get, newVersion))), //HTTP Location header
                 Some(lastModified), //HTTP Last-Modified header
                 Some(newVersion) //HTTP ETag header

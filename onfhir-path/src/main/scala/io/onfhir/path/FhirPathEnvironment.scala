@@ -1,17 +1,24 @@
 package io.onfhir.path
 
-import io.onfhir.api.Resource
-
+import io.onfhir.api.validation.IReferenceResolver
 
 import scala.util.matching.Regex
 
-class FhirPathEnvironment(resource:Resource) {
+class FhirPathEnvironment(val _this:FhirPathResult, val referenceResolver: Option[IReferenceResolver]) {
   val vsPattern:Regex = "'vs-[A-Za-z0-9\\-]+'".r
   val extPattern:Regex = "'ext-[A-Za-z0-9\\-]+'".r
 
+  //Resource that is validated
+  lazy val resolvedResource =
+    referenceResolver
+      .map(_.resource).toSeq
+      .flatMap(FhirPathValueTransformer.transform(_))
+
   def getEnvironmentContext(ename:String):Seq[FhirPathResult] = {
     ename match {
-      case "%context" => Seq(FhirPathComplex(resource))
+      //Trying to access to the root resource validated
+      case "%resource" => resolvedResource
+      case "%context"  => Seq(_this)
       //Fixed codes
       case "%ucum" => Seq(FhirPathString("http://unitsofmeasure.org"))
       case "%sct" => Seq(FhirPathString("http://snomed.info/sct"))

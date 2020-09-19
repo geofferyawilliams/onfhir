@@ -3,7 +3,9 @@ package io.onfhir.path
 import java.time.{Duration, LocalDate, LocalDateTime, LocalTime, Period, Year, YearMonth, ZoneId, ZonedDateTime}
 import java.time.temporal.{ChronoField, ChronoUnit, Temporal, TemporalAmount}
 
-import org.json4s.JsonAST.JObject
+import io.onfhir.api.util.FHIRUtil
+import io.onfhir.path.FhirPathValueTransformer.transform
+import org.json4s.JsonAST.{JBool, JDecimal, JLong, JObject, JString, JValue}
 
 import scala.math.BigDecimal.RoundingMode
 import scala.math.BigDecimal.RoundingMode.RoundingMode
@@ -30,6 +32,12 @@ sealed trait FhirPathResult {
     * @return
     */
   def isEquivalent(that:FhirPathResult):Boolean = isEqual(that).getOrElse(false)
+
+  /**
+   * Convert the result to json4s.model
+   * @return
+   */
+  def toJson:JValue
 }
 
 /**
@@ -51,6 +59,8 @@ case class FhirPathString(s:String) extends FhirPathResult with Ordered[FhirPath
     case FhirPathString(s2) => s.trim().replaceAll(" +", " ").equalsIgnoreCase(s2.trim().replaceAll(" +", " "))
     case _ => false
   }
+
+  def toJson:JValue = JString(s)
 }
 
 /**
@@ -82,6 +92,8 @@ case class FhirPathNumber(v:BigDecimal) extends FhirPathResult with Ordered[Fhir
     }
 
   def isInteger():Boolean = v - v.toInt == 0
+
+  def toJson:JValue = if(isInteger()) JLong(v.toLong) else JDecimal(v)
 }
 
 /**
@@ -117,7 +129,7 @@ case class FhirPathDateTime(dt:Temporal) extends FhirPathResult with Ordered[Fhi
             case (o2, dt2:LocalDateTime) => dt2.getYear == o2.get(ChronoField.YEAR) && dt2.getMonthValue == o2.get(ChronoField.MONTH_OF_YEAR) && dt2.getDayOfMonth == o2.get(ChronoField.DAY_OF_MONTH) &&
               dt2.getHour == o2.get(ChronoField.HOUR_OF_DAY) && dt2.getMinute == o2.get(ChronoField.MINUTE_OF_HOUR) && dt2.getSecond == o2.get(ChronoField.SECOND_OF_MINUTE)
             case (zdt1:ZonedDateTime, zdt2:ZonedDateTime) => zdt1.isEqual(zdt2)
-            case (oth1, oth2) => throw new Exception(s"Invalid datetime comparison between $oth1 and $oth2 ...")
+            case (oth1, oth2) => throw new FhirPathException(s"Invalid datetime comparison between $oth1 and $oth2 ...")
           }
        )
   }
@@ -154,7 +166,7 @@ case class FhirPathDateTime(dt:Temporal) extends FhirPathResult with Ordered[Fhi
       case (zdt1:ZonedDateTime, d2:LocalDate) => zdt1.compareTo(d2.atTime(0, 0).atZone(ZoneId.of("Z")))
       case (zdt1:ZonedDateTime, dt2:LocalDateTime) => zdt1.compareTo(dt2.atZone(ZoneId.of("Z")))
       case (zdt1:ZonedDateTime, zdt2:ZonedDateTime) => zdt1.compareTo(zdt2)
-      case (oth1, oth2) => throw new Exception(s"Invalid datetime comparison between $oth1 and $oth2 ...")
+      case (oth1, oth2) => throw new FhirPathException(s"Invalid datetime comparison between $oth1 and $oth2 ...")
     }
   }
 
@@ -204,8 +216,16 @@ case class FhirPathDateTime(dt:Temporal) extends FhirPathResult with Ordered[Fhi
         case zdt:ZonedDateTime => zdt.plus(duration)
       }
     } catch {
-      case e:Exception => throw new Exception(s"Invalid datetime arithmetic on $dt for quantity $amountToAdd and unit $unit !")
+      case e:Exception => throw new FhirPathException(s"Invalid datetime arithmetic on $dt for quantity $amountToAdd and unit $unit !")
     }
+  }
+
+  def toJson:JValue = dt match {
+    case y:Year => JString(y.toString)
+    case ym:YearMonth => JString(ym.toString)
+    case ld:LocalDate => JString(ld.toString)
+    case ldt:LocalDateTime => JString(ldt.toString)
+    case zdt:ZonedDateTime => JString(zdt.toString)
   }
 }
 
@@ -227,7 +247,7 @@ case class FhirPathTime(lt:LocalTime, zone:Option[ZoneId] = None) extends FhirPa
         case "'ms'" => lt.plus(amountToAdd, ChronoUnit.MILLIS)
       }
     } catch {
-      case e:Exception => throw new Exception(s"Invalid datetime arithmetic on $lt with zone $zone for quantity $amountToAdd and unit $unit !")
+      case e:Exception => throw new FhirPathException(s"Invalid datetime arithmetic on $lt with zone $zone for quantity $amountToAdd and unit $unit !")
     }
   }
 
@@ -257,6 +277,7 @@ case class FhirPathTime(lt:LocalTime, zone:Option[ZoneId] = None) extends FhirPa
     }
   }
 
+  def toJson:JValue = JString(lt.toString + zone.map(z=> z.toString).getOrElse(""))
 }
 
 /**
@@ -264,7 +285,7 @@ case class FhirPathTime(lt:LocalTime, zone:Option[ZoneId] = None) extends FhirPa
   * @param b
   */
 case class FhirPathBoolean(b:Boolean) extends FhirPathResult {
-  def or (that:FhirPathBoolean) = FhirPathBoolean(b | that.b)
+  def or (that:FhirPathBoolean) = FhirPathBoolean(b || that.b)
   def and (that:FhirPathBoolean) = FhirPathBoolean(b && that.b)
   def xor (that:FhirPathBoolean) = FhirPathBoolean(b ^ that.b)
 
@@ -273,6 +294,8 @@ case class FhirPathBoolean(b:Boolean) extends FhirPathResult {
       case FhirPathBoolean(b2) => Some(b == b2)
       case _ => Some(false)
     }
+
+  def toJson:JValue = JBool(b)
 }
 
 /**
@@ -280,13 +303,19 @@ case class FhirPathBoolean(b:Boolean) extends FhirPathResult {
   * @param q
   * @param unit
   */
-case class FhirPathQuantity(q:FhirPathNumber, unit:String) extends FhirPathResult {
+case class FhirPathQuantity(q:FhirPathNumber, unit:String) extends FhirPathResult with Ordered[FhirPathQuantity]  {
   override def isEqual(that:FhirPathResult):Option[Boolean] = {
     that match {
       case FhirPathQuantity(q2, u2) => Some(q.isEqual(q2).getOrElse(false) && unit == u2)
       case _ => Some(false)
     }
   }
+
+  override def compare(that:FhirPathQuantity):Int = {
+    q.compareTo(that.q)
+  }
+
+  def toJson:JValue = JObject("value" -> q.toJson ,  "system" -> JString("http://unitsofmeasure.org"), "code"-> JString(unit),"unit" -> JString(unit))
 }
 
 /**
@@ -301,4 +330,24 @@ case class FhirPathComplex(json:JObject) extends FhirPathResult {
       case _ => Some(false)
     }
   }
+
+  /**
+   * Try to convert it to Quantity if it is
+   * @return
+   */
+  def toQuantity():Option[FhirPathQuantity] = {
+    val fields = json.obj.map(_._1).toSet
+    if(fields.contains("value") && fields.subsetOf(Set("value", "unit", "system", "code", "comparator", "extension", "id"))){
+      val n = FhirPathNumber(FHIRUtil.extractValue[BigDecimal](json, "value"))
+
+      val unit = FHIRUtil.extractValueOption[String](json, "code") match {
+        case None => FHIRUtil.extractValueOption[String](json, "unit")
+        case Some(x) => Some(x)
+      }
+      Some(FhirPathQuantity.apply(n, unit.getOrElse("")))
+    } else
+      None
+  }
+
+  def toJson:JValue = json
 }

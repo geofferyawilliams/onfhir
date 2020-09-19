@@ -1,11 +1,10 @@
 package io.onfhir.db
 
+import java.time.Instant
 import java.util.UUID
 
-import akka.http.scaladsl
-import ca.uhn.fhir.validation.ResultSeverityEnum
 import com.mongodb.bulk.BulkWriteUpsert
-import com.mongodb.client.model.{Field, InsertOneModel}
+import com.mongodb.client.model.{BsonField, Field, InsertOneModel}
 import io.onfhir.Onfhir
 import io.onfhir.api._
 import io.onfhir.config.OnfhirConfig
@@ -13,13 +12,17 @@ import io.onfhir.exception.{ConflictException, InternalServerException}
 import org.mongodb.scala.bson.collection.immutable.Document
 import org.mongodb.scala.bson.conversions.Bson
 import org.mongodb.scala.bson.{BsonArray, BsonDateTime, BsonDocument, BsonString, BsonValue}
-import org.mongodb.scala.model.Filters.{and, equal, in, notEqual}
+import org.mongodb.scala.model.Filters.{and, equal, in, nin, notEqual}
 import org.mongodb.scala.model.Projections.{exclude, include}
 import org.mongodb.scala.model.Sorts.{ascending, descending}
 import com.mongodb.client.model.Updates.setOnInsert
 import io.onfhir.api.model.{FHIRResponse, OutcomeIssue}
-import org.mongodb.scala.model.{Aggregates, BulkWriteOptions, UpdateOptions, Updates}
-import org.mongodb.scala.{Completed, FindObservable, MongoCollection}
+import io.onfhir.util.DateTimeUtil
+import org.bson.BsonValue
+import org.json4s.JValue
+import org.mongodb.scala.model.{Accumulators, Aggregates, BsonField, BulkWriteOptions, Filters, Projections, UpdateOptions, Updates}
+import org.mongodb.scala.{Completed, FindObservable, MongoCollection, bson}
+import org.mongodb.scala.bson._
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ListBuffer
@@ -147,6 +150,7 @@ object DocumentManager {
     * @param sortingPaths Sorting parameters and sorting direction (negative: descending, positive: ascending)
     * @param includingOrExcludingFields List of to be specifically included or excluded fields in the resulting document, if not given; all document included (true-> include, false -> exclude)
     * @param excludeExtraFields If true exclude extra fields related with version control from the document
+    * @param excludeDeleted If deleted resources are not taken into accouunt in search or not
     * @return Two sequence of documents (matched, includes); First the matched documents for the main query, Second included resources
     */
   def searchDocuments(rtype:String,
@@ -155,7 +159,8 @@ object DocumentManager {
                       page:Int= 1,
                       sortingPaths:Seq[(String, Int, Seq[String])] = Seq.empty,
                       includingOrExcludingFields:Option[(Boolean, Set[String])] = None,
-                      excludeExtraFields:Boolean = false)(implicit transactionSession: Option[TransactionSession] = None):Future[Seq[Document]] = {
+                      excludeExtraFields:Boolean = false,
+                      excludeDeleted:Boolean = true )(implicit transactionSession: Option[TransactionSession] = None):Future[Seq[Document]] = {
 
     //If we have alternative paths for a search parameter, use search by aggregation
     if(sortingPaths.exists(_._3.length > 1)){
@@ -163,14 +168,14 @@ object DocumentManager {
     }
     //Otherwise run a normal MongoDB find query
     else {
-      val finalFilter = filter match {
-        case None => isActiveQuery
-        case Some(sfilter) => and(isActiveQuery, sfilter)
+      val finalFilter:Option[Bson] = filter match {
+        case None => if(excludeDeleted) Some(isActiveQuery) else None
+        case Some(sfilter) => if(excludeDeleted) Some(and(isActiveQuery, sfilter)) else Some(sfilter)
       }
       //Construct query
       var query = transactionSession match {
-        case None => MongoDB.getCollection(rtype).find(finalFilter)
-        case Some(ts) => MongoDB.getCollection(rtype).find(ts.dbSession, finalFilter)
+        case None => if(finalFilter.isDefined ) MongoDB.getCollection(rtype).find(finalFilter.get) else MongoDB.getCollection(rtype).find()
+        case Some(ts) => if(finalFilter.isDefined )  MongoDB.getCollection(rtype).find(ts.dbSession, finalFilter.get) else MongoDB.getCollection(rtype).find(ts.dbSession)
       }
 
       //Handle sorting
@@ -230,7 +235,7 @@ object DocumentManager {
         aggregations.append(Aggregates.sort( if(sp._2 > 0) ascending(sp._3.head) else descending(sp._3.head)))
       //For multiple alternatives, sort against the added field which is based on parameter name
       case _ =>
-        aggregations.append(Aggregates.sort( if(sp._2 > 0) ascending(s"__sort_${sp._1}") else ascending(s"__sort_${sp._1}")))
+        aggregations.append(Aggregates.sort( if(sp._2 > 0) ascending(s"__sort_${sp._1}") else descending(s"__sort_${sp._1}")))
     })
 
     //Handle paging parameters
@@ -352,14 +357,14 @@ object DocumentManager {
     * @param query Mongo query
     * @return
     */
-  def countDocuments(rtype:String, query:Option[Bson])(implicit transactionSession: Option[TransactionSession] = None): Future[Long] = {
+  def countDocuments(rtype:String, query:Option[Bson], excludeDeleted:Boolean = true)(implicit transactionSession: Option[TransactionSession] = None): Future[Long] = {
     getCount(
       rtype,
-      Some(
-        query
-          .map(and(isActiveQuery, _))
-          .getOrElse(isActiveQuery)
-      )
+      query
+          .map(q => if(excludeDeleted) and(isActiveQuery, q) else q) match {
+        case None => if(excludeDeleted) Some(isActiveQuery) else None
+        case oth => oth
+      }
     )
   }
 
@@ -418,6 +423,118 @@ object DocumentManager {
     searchDocuments(rtype, Some(filter), count, page, sortingPaths, includingOrExcludingFields = Some(true -> Set(FHIR_COMMON_FIELDS.ID)))
       .map(_.map(_.getString(FHIR_COMMON_FIELDS.ID)))
   }
+
+
+  /**
+   * Search on historic instances and get the highest version that matches the query
+   * @param rtype               Resource type
+   * @param rid                 Resource id
+   * @param filter              Query itself
+   * @param count               Number of resources
+   * @param skip                Number of records to be skipped
+   * @return
+   */
+  def getHistoricLast(rtype:String,  rid:Option[String], filter:Option[Bson], count:Int = -1, skip:Int = -1):Future[Seq[Document]] = {
+    val collection = MongoDB.getCollection(rtype, true)
+
+    val finalFilter = andQueries(rid.map(ridQuery).toSeq ++ filter.toSeq)
+    val aggregations = new ListBuffer[Bson]
+
+    //Filter with the query
+    finalFilter.foreach(ff => aggregations.append(Aggregates.filter(ff)))
+    //Sort according to version in descending order
+    aggregations.append(Aggregates.sort(descending("meta.versionId")))
+    //Group by resource id and get the first for each group (means the biggest version)
+    aggregations.append(Aggregates.group("$id", Accumulators.first("first", "$$CURRENT")))
+    //Paging
+    if(skip != -1)
+      aggregations.append(Aggregates.skip(skip))
+    if(count != -1)
+      aggregations.append(Aggregates.limit(count))
+
+
+  collection.aggregate(aggregations).toFuture().map(results =>
+      results.map(r => Document(r.get("first").get.asDocument()))
+    )
+  }
+
+  /**
+   * Count the instances where one of the versions satisfies the quesy
+   * @param rtype               Resource type
+   * @param rid                 Resource id
+   * @param filter              Query itself
+   * @return
+   */
+  def countHistoricLast(rtype:String,  rid:Option[String], filter:Option[Bson]):Future[Long] = {
+    val collection = MongoDB.getCollection(rtype, true)
+
+    val finalFilter = andQueries(rid.map(ridQuery).toSeq ++ filter.toSeq)
+    val aggregations = new ListBuffer[Bson]
+
+    //Filter with the query
+    finalFilter.foreach(ff => aggregations.append(Aggregates.filter(ff)))
+    //Sort according to version in descending order
+    aggregations.append(Aggregates.sort(descending("meta.versionId")))
+    //Group by resource id and get the first for each group (means the biggest version)
+    aggregations.append(Aggregates.group("$id", Accumulators.first("first", "$id")))
+
+
+    collection.aggregate(aggregations).toFuture().map(results =>
+      results.length
+    )
+  }
+
+  def searchHistoricDocumentsWithAt(rtype:String,  rid:Option[String], filter:Option[Bson], count:Int = -1, page:Int = -1):Future[(Long,Seq[Document])] = {
+    def getIdsOfAllCurrents():Future[Seq[String]] = {
+      DocumentManager
+        .searchDocuments(rtype, DocumentManager.andQueries(rid.map(ridQuery).toSeq ++ filter.toSeq), count, page, includingOrExcludingFields  = Some(true, Set(FHIR_COMMON_FIELDS.ID)), excludeDeleted = false)
+        .map(docs => docs.map(d => d.getString(FHIR_COMMON_FIELDS.ID)))
+    }
+
+    val totalCurrentFuture = DocumentManager.countDocuments(rtype, DocumentManager.andQueries(rid.map(ridQuery).toSeq ++ filter.toSeq), excludeDeleted = false)
+
+    totalCurrentFuture.flatMap {
+      //If all records can be supplied from currents
+      case totalCurrent:Long if count * page <= totalCurrent =>
+        DocumentManager
+          .searchDocuments(rtype, DocumentManager.andQueries(rid.map(ridQuery).toSeq ++ filter.toSeq), count, page, excludeDeleted = false)
+          .flatMap(docs => {
+            getIdsOfAllCurrents().flatMap(ids =>
+              DocumentManager
+                .countHistoricLast(rtype, rid,  if(ids.nonEmpty) DocumentManager.andQueries(filter.toSeq :+ nin(FHIR_COMMON_FIELDS.ID, ids:_*)) else  filter)
+                .map(totalHistory => (totalCurrent + totalHistory) -> docs)
+            )
+          })
+      //If some of them should be from current some from history
+      case totalCurrent:Long if count * page > totalCurrent && count * (page-1) < totalCurrent =>
+        DocumentManager
+          .searchDocuments(rtype, DocumentManager.andQueries(rid.map(ridQuery).toSeq ++ filter.toSeq), count, page, excludeDeleted = false)
+          .flatMap(currentDocs => {
+            val numOfNeeded = count * page - totalCurrent
+            getIdsOfAllCurrents().flatMap(ids =>
+              DocumentManager
+                .countHistoricLast(rtype, rid, if(ids.nonEmpty) DocumentManager.andQueries(filter.toSeq :+ nin(FHIR_COMMON_FIELDS.ID, ids:_*)) else  filter)
+                .flatMap(totalHistory=>
+                  DocumentManager.getHistoricLast(rtype, rid, if(ids.nonEmpty) DocumentManager.andQueries(filter.toSeq :+ nin(FHIR_COMMON_FIELDS.ID, ids:_*)) else  filter, numOfNeeded.toInt).map(historicDocs =>
+                    (totalCurrent + totalHistory) -> (currentDocs ++ historicDocs)
+                  )
+                )
+            )
+          })
+      case totalCurrent:Long if count * (page-1) >= totalCurrent =>
+        val numToSkip = count * (page-1) - totalCurrent
+        getIdsOfAllCurrents().flatMap(ids =>
+          DocumentManager
+            .countHistoricLast(rtype, rid, if(ids.nonEmpty) DocumentManager.andQueries(filter.toSeq :+ nin(FHIR_COMMON_FIELDS.ID, ids:_*)) else  filter)
+            .flatMap(totalHistory =>
+            DocumentManager.getHistoricLast(rtype, rid, if(ids.nonEmpty) DocumentManager.andQueries(filter.toSeq :+ nin(FHIR_COMMON_FIELDS.ID, ids:_*)) else  filter, count, numToSkip.toInt).map(historicDocs =>
+              (totalCurrent + totalHistory) -> historicDocs
+            )
+          )
+        )
+    }
+  }
+
 
   /**
     * Search on all FHIR resources including the history versions
@@ -580,7 +697,7 @@ object DocumentManager {
     * @param newDocumentOrDeleted New version of document or status code for deletion
     * @return
     */
-  def insertNewVersion(rtype:String, rid:String, newDocumentOrDeleted:Either[Document, (String, scaladsl.model.DateTime)], oldDocument:(Long, Document), shardQuery:Option[Bson] = None)(implicit transactionSession: Option[TransactionSession] = None):Future[Completed] = {
+  def insertNewVersion(rtype:String, rid:String, newDocumentOrDeleted:Either[Document, (String, Instant)], oldDocument:(Long, Document), shardQuery:Option[Bson] = None)(implicit transactionSession: Option[TransactionSession] = None):Future[Completed] = {
     val needTransaction = transactionSession.isEmpty && OnfhirConfig.mongoUseTransaction
     //Create a transaction session if we support it but it is not part of a transaction
     val tempTransaction =
@@ -601,7 +718,7 @@ object DocumentManager {
               //Throw 409 Conflict exception
               throw throw new ConflictException(
                 OutcomeIssue(
-                  ResultSeverityEnum.ERROR.getCode,
+                  FHIRResponse.SEVERITY_CODES.ERROR,
                   FHIRResponse.OUTCOME_CODES.TRANSIENT,
                   None,
                   Some(s"Concurrent update on resource $rid, another interaction is currently overriding the resource! Please try again after a few seconds..."),
@@ -684,7 +801,7 @@ object DocumentManager {
     * @param transactionSession Transaction session
     * @return
     */
-  def deleteCurrent(rtype:String, rid:String, sc:String, newVersion:Long, lastModified:scaladsl.model.DateTime, shardQuery:Option[Bson])(implicit transactionSession: Option[TransactionSession] = None):Future[Boolean] = {
+  def deleteCurrent(rtype:String, rid:String, sc:String, newVersion:Long, lastModified:Instant, shardQuery:Option[Bson])(implicit transactionSession: Option[TransactionSession] = None):Future[Boolean] = {
     val collection = MongoDB.getCollection(rtype)
     val baseQuery = equal(FHIR_COMMON_FIELDS.ID, rid)
     val query = shardQuery.map(sq => and(sq,  baseQuery)).getOrElse(baseQuery)
@@ -696,7 +813,9 @@ object DocumentManager {
           //Set the new version id
           Updates.set(FHIR_COMMON_FIELDS.META + "." +FHIR_COMMON_FIELDS.VERSION_ID, ""+newVersion),
           //Set the last update time
-          Updates.set(FHIR_COMMON_FIELDS.META + "." +FHIR_COMMON_FIELDS.LAST_UPDATED, BsonDateTime(lastModified.clicks)),
+          Updates.set(FHIR_COMMON_FIELDS.META + "." +FHIR_COMMON_FIELDS.LAST_UPDATED,
+            BsonTransformer.createBsonTimeObject(DateTimeUtil.serializeInstant(lastModified))
+          ),
           //Set the status code
           Updates.set(FHIR_EXTRA_FIELDS.STATUS_CODE, sc),
           //Set method as delete
@@ -739,5 +858,87 @@ object DocumentManager {
       .deleteMany(query)
       .toFuture()
       .map(dr => dr.getDeletedCount)
+  }
+
+
+  /**
+   *
+   * @param rtype                         Resource type
+   * @param filter                        Query to filter the results
+   * @param lastOrFirstN                  Number of last/first results to return for each group;
+   *                                        - negative value means last e.g -2 --> last 2
+   *                                        - positive value means first e.g. 3 --> first 3
+   * @param sortingPaths                  Query params and its alternative paths for sorting the results (sorting is default in ascending)
+   *                                      e.g.for Observations  date -> Seq(effectiveDateTime, effectivePeriod.start, etc)
+   * @param groupByExpressions            Search parameters to execute group by on and the Mongo expression for them to group by
+   *                                      e.g. for Observations  code -> ($concat(code.coding.system, code.coding.code) ....
+   * @param includingOrExcludingFields    List of to be specifically included or excluded fields in the resulting document, if not given;
+   *                                      all document included (true-> include, false -> exclude)
+   * @param excludeExtraFields            If true exclude extra fields related with version control from the document
+   * @return                              Sequence of JObject including bucket keys, Resources belong to that bucket
+   */
+  def searchLastOrFirstNByAggregation(rtype:String,
+                               filter:Option[Bson],
+                               lastOrFirstN:Int = -1,
+                               sortingPaths:Seq[(String, Seq[String])] = Seq.empty,
+                               groupByExpressions:Seq[(String, BsonValue)],
+                               includingOrExcludingFields:Option[(Boolean, Set[String])] = None,
+                               excludeExtraFields:Boolean = false):Future[Seq[(Document, Seq[Document])]] = {
+
+    val aggregations = new ListBuffer[Bson]
+    //First, append the match query
+    if(filter.isDefined)
+      aggregations.append(Aggregates.`match`(filter.get))
+
+    val spaths = sortingPaths.map(s => (s._1, if(lastOrFirstN < 0) -1 else 1, s._2))
+
+    //Identify the sorting params that has alternative paths
+    val paramsWithAlternativeSorting = spaths.filter(_._3.length > 1) //Those that have multiple paths
+
+    //Then add common sorting field for sort parameters that has multiple alternative paths
+    aggregations.append(paramsWithAlternativeSorting.map(sp => addFieldAggregationForParamWithAlternativeSorting(sp)) : _*)
+
+    //Add sorting aggregations
+    spaths.foreach(sp => sp._3.length match {
+      //For single alternative path, sort it
+      case 1 =>
+        aggregations.append(Aggregates.sort( if(sp._2 > 0) ascending(sp._3.head) else descending(sp._3.head)))
+      //For multiple alternatives, sort against the added field which is based on parameter name
+      case _ =>
+        aggregations.append(Aggregates.sort( if(sp._2 > 0) ascending(s"__sort_${sp._1}") else descending(s"__sort_${sp._1}")))
+    })
+
+    //Handle projections
+    val extraSortingFieldsToExclude = paramsWithAlternativeSorting.map(sp => s"__sort_${sp._1}")
+    aggregations.append(handleProjectionForAggregationSearch(includingOrExcludingFields, excludeExtraFields, extraSortingFieldsToExclude.toSet))
+
+    //Merge the expressions into single groupBy expression
+    val groupByExpr:Document = Document.apply(groupByExpressions)
+    //based on the n value
+    lastOrFirstN match {
+      //last one or first one (we already sort based on the sign if last one it is sorted in descending)
+      case -1 | 1 =>
+        aggregations.append(Aggregates.group(groupByExpr, Accumulators.first("first", "$$CURRENT")))
+      //first or last n
+      case o =>
+        aggregations.append(Aggregates.group(groupByExpr, Accumulators.push("docs", "$$CURRENT")))
+        aggregations.append(Aggregates.project(Projections.computed("bucket", AggregationUtil.constructSliceExpression("docs", Math.abs(o)))))
+    }
+
+    MongoDB
+      .getCollection(rtype)
+      .aggregate(aggregations)  //run the aggregation pipeline
+      .allowDiskUse(true) //these aggregations may not fit into memory restrictions defined by mongo
+      .toFuture()
+      .map(results =>
+        results
+          .map(d =>
+            if(Math.abs(lastOrFirstN)> 1)
+              Document(d.get[BsonDocument]("_id").get) ->
+                d.get[BsonArray]("bucket").get.getValues.asScala.map(v => Document(v.asInstanceOf[BsonDocument]))
+            else
+              Document(d.get[BsonDocument]("_id").get) -> d.get[BsonDocument]("first").toSeq.map(Document(_))
+          )
+      )
   }
 }
